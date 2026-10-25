@@ -66,33 +66,42 @@ impl Cic {
     #[must_use]
     pub fn run(&mut self, ring_bytes: &[u8], out: &mut [i32]) -> usize {
         debug_assert!(ring_bytes.len() % DIAG_BOX == 0);
+        let word_count = ring_bytes.len() / 4;
+        let base = ring_bytes.as_ptr() as *const u32;
+        // 紧凑内循环（板上实测：迭代器版 7.9 cycles/byte，超 40 MB/s 全
+        // 消费预算 1.3 倍；理论 SWAR+积分 ~2.4，裸指针+寄存器驻留逼近）
+        const MASK: u32 = 0x0F0F_0F0F;
+        const XOR: u32 = 0x8888_8888;
         let mut produced = 0usize;
-        for chunk16 in ring_bytes.chunks_exact(DIAG_BOX) {
-            let mut words = [0u32; 4];
-            for (index, word) in words.iter_mut().enumerate() {
-                let offset = index * 4;
-                *word = u32::from_le_bytes([
-                    chunk16[offset],
-                    chunk16[offset + 1],
-                    chunk16[offset + 2],
-                    chunk16[offset + 3],
-                ]);
-            }
-            let (si, sq) = box16(&words);
-            self.i1 = self.i1.wrapping_add(si as u32);
-            self.i2 = self.i2.wrapping_add(self.i1);
-            self.i3 = self.i3.wrapping_add(self.i2);
-            self.q1 = self.q1.wrapping_add(sq as u32);
-            self.q2 = self.q2.wrapping_add(self.q1);
-            self.q3 = self.q3.wrapping_add(self.q2);
-            self.phase += 1;
-            if self.phase == self.rate {
-                self.phase = 0;
-                // 三级梳状：x 减去自身上一次的值，重复三次
-                let mut ti = self.i3.wrapping_sub(self.di1);
-                self.di1 = self.i3;
-                let mut tq = self.q3.wrapping_sub(self.dq1);
-                self.dq1 = self.q3;
+        let mut word = 0usize;
+        // 寄存器驻留的积分器状态（写回在出口）
+        let (mut i1, mut i2, mut i3) = (self.i1, self.i2, self.i3);
+        let (mut q1, mut q2, mut q3) = (self.q1, self.q2, self.q3);
+        let mut phase = self.phase;
+        while word < word_count {
+            // SAFETY: word_count 按 DIAG_BOX 对齐的长度折算，四个访问
+            // 恰在切片内；read_unaligned 对任意对齐安全。
+            let a = unsafe { core::ptr::read_unaligned(base.add(word)) } ^ XOR;
+            let b = unsafe { core::ptr::read_unaligned(base.add(word + 1)) } ^ XOR;
+            let c = unsafe { core::ptr::read_unaligned(base.add(word + 2)) } ^ XOR;
+            let d = unsafe { core::ptr::read_unaligned(base.add(word + 3)) } ^ XOR;
+            let lo = (a & MASK) + (b & MASK) + (c & MASK) + (d & MASK);
+            let hi = ((a >> 4) & MASK) + ((b >> 4) & MASK) + ((c >> 4) & MASK) + ((d >> 4) & MASK);
+            let sq = ((lo.wrapping_mul(0x0101_0101)) >> 24).wrapping_sub(128) as u32;
+            let si = ((hi.wrapping_mul(0x0101_0101)) >> 24).wrapping_sub(128) as u32;
+            i1 = i1.wrapping_add(si);
+            i2 = i2.wrapping_add(i1);
+            i3 = i3.wrapping_add(i2);
+            q1 = q1.wrapping_add(sq);
+            q2 = q2.wrapping_add(q1);
+            q3 = q3.wrapping_add(q2);
+            phase += 1;
+            if phase == self.rate {
+                phase = 0;
+                let mut ti = i3.wrapping_sub(self.di1);
+                self.di1 = i3;
+                let mut tq = q3.wrapping_sub(self.dq1);
+                self.dq1 = q3;
                 let ui = ti.wrapping_sub(self.di2);
                 let uq = tq.wrapping_sub(self.dq2);
                 self.di2 = ti;
@@ -109,7 +118,15 @@ impl Cic {
                     produced += 1;
                 }
             }
+            word += 4;
         }
+        self.i1 = i1;
+        self.i2 = i2;
+        self.i3 = i3;
+        self.q1 = q1;
+        self.q2 = q2;
+        self.q3 = q3;
+        self.phase = phase;
         produced
     }
 }

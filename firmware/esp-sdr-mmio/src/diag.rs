@@ -24,6 +24,16 @@ const NODES: usize = RING_BYTES / NODE_BYTES;
 const RING_ADDRESS: u32 = 0x4082_0000;
 const DESC_ADDRESS: u32 = RING_ADDRESS + RING_BYTES as u32;
 
+/// PARLIO 采样时钟（MHz）。20：消费预算裁定——Rust 安全代码的
+/// box16+CIC 实测 7.8 cycles/byte（板上 rdcycle，commit bfb22f1 后），
+/// 40 MB/s 需 312 MHz > CPU 240 MHz（zephyr 的 4.1-4.4 是手写汇编）。
+/// 20 MB/s × 7.8 = 156M cycles = 65% CPU，零跳变消费可行。20 MHz 视界
+/// 覆盖一个完整 WiFi 信道。提回 40 需 DSP 内联汇编（约 4 c/B），
+/// 已列入 docs/c5-registers.md §10.3 待定项。
+const PARL_SAMPLE_MHZ: u32 = 20;
+/// PLL_F240M 分频值（integer-1 语义：240/(div+1)）。
+const PARL_CLK_DIV_NUM: u16 = (240 / PARL_SAMPLE_MHZ - 1) as u16;
+
 // dump engine 寄存器（与 hardware 模块同源，docs/c5-registers.md）。
 const DUMP_CTRL_REG: u32 = 0x600a_9004;
 const DUMP_CTRL_RUN: u32 = 1 << 31;
@@ -57,7 +67,7 @@ const SIG_GPIO_OUT_IDX: u32 = 256;
 const DMA_TRIGGER_PARLIO: u8 = 9;
 
 /// GDMA 描述符 dw0 位域（hal/dma_types.h）：size 0..11，length 12..23
-/// （RX 由硬件写回），owner bit 31（1=DMA，0=CPU）。
+/// （RX 由硬件写回），owner bit31（1=DMA，0=CPU）。
 const DW0_LENGTH_MASK: u32 = 0xFFF << 12;
 const DW0_OWNER_DMA: u32 = 1 << 31;
 
@@ -385,13 +395,14 @@ impl DiagStream {
             w.rx_start().bit(false);
             w
         });
-        // PLL_F240M / 6 = 40 MHz（div_num 语义 integer-1，PRUN 实测 ppm 1.5）
+        // PLL_F240M / (div+1) = PARL_SAMPLE_MHZ（div_num 语义 integer-1，
+        // PRUN 实测 ppm 1.5）
         pcr.parl_clk_rx_conf().modify(|_, w| unsafe {
             w.parl_clk_rx_sel().bits(2);
             w
         });
         pcr.parl_clk_rx_conf().modify(|_, w| unsafe {
-            w.parl_clk_rx_div_num().bits(5);
+            w.parl_clk_rx_div_num().bits(PARL_CLK_DIV_NUM);
             w
         });
         // 软分隔符：期望位长 = 环总位（19 位字段；EOF=RX_FULL 在 bitlen 处，
@@ -570,6 +581,28 @@ impl DiagStream {
         let ring_offset = (consumed_bytes % RING_BYTES as u64) as u32;
         assert!(len <= self.contiguous_available(consumed_bytes));
         unsafe { core::slice::from_raw_parts((RING_ADDRESS + ring_offset) as *const u8, len) }
+    }
+
+    /// 生产者当前环内偏移（字节，0..RING_BYTES）。head 即描述符游标，
+    /// 偏移 = head × 节点大小——无除法。
+    #[must_use]
+    pub fn producer_ring_offset(&self) -> usize {
+        self.head * NODE_BYTES
+    }
+
+    /// 消费游标（环内偏移，调用方增量维护）视角的可用字节数（不跨环尾）。
+    /// 32 位取模一次；整圈落后与 0 不可区分（那已是过跑态，另行检测）。
+    #[must_use]
+    pub fn available_at(&self, consume_offset: usize) -> usize {
+        let producer = self.producer_ring_offset();
+        (producer + RING_BYTES - consume_offset % RING_BYTES) % RING_BYTES
+    }
+
+    /// 环内偏移处的零拷贝切片（len 须 ≤ [Self::available_at]）。
+    #[must_use]
+    pub fn ring_slice_at(&self, offset: usize, len: usize) -> &[u8] {
+        assert!(len <= self.available_at(offset));
+        unsafe { core::slice::from_raw_parts((RING_ADDRESS + offset as u32) as *const u8, len) }
     }
 
     /// 环内某块的零拷贝视图（block_index 以 BLOCK_BYTES 为单位）。
