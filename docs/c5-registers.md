@@ -109,10 +109,38 @@ prepare_rx();
 - CPU 节拍 TX：`0x600a0c08` 单字存储（store 15 周期；轮询 ~1.35 MS/s；预打包单 store 循环 8 MS/s）
 - TX 前需 vendor CW 先打开发射链；半双工：TX 期间 RX 冻结（§3 恢复）
 
-## 8. 待实测确认（C2 检查点）
+## 8. C2 实测结论（rev v1.2 本板，含与参考项目的差异）
 
-- divider → 速率的精确映射（LIMITS 表 6 档 vs adctrig divider*2 编码）
-- `rx_recalibration.c` 的重校准触发条件与移植必要性
-- 带宽 mode 参数取值（rx_bandwidth.h）
-- AGCPWR_CTRL7 bit 23 的语义（C1 实测：手动增益 40 锁定后仍读 0；
-  上游从未标注该位，不能当作"已强制"指示）
+- **采集必须走 vendor adctrig**（librftest.a + libbttestmode.a，esp-phy-lib
+  commit 20f1db05）。手写寄存器序列（zephyr 路径）在 esp_wifi 启动后的运行
+  环境里，写 SRAM 属主寄存器会触发 CPU 锁死——让渡瞬间有未知上下文访问块 1；
+  裸机早期同写法可恢复（ROM 打印 RV_STK_EPC）。vendor 代码内部规避了该问题。
+- **librftest.a 的 shell 依赖 libbttestmode.a**（ble_rx_start / bt_testmode_init /
+  esp_ble_rx_func / zb_rx 所在），该库 Rust 生态与 esp-phy-lib 文档均未提及。
+- **混杂模式必须开启**：未连接 STA 的接收链会下电，ADC 输出冻结为常量
+  （dump 总线保持末值，全帧同一字）。esp_radio sniffer 的
+  set_promiscuous_mode(true) 使接收链持续在线后样本恢复正常。
+  对齐上游 app_main 的 esp_wifi_set_promiscuous(true)——此前认为"用不到"是误判。
+- **DONE 位**：bit 18（对齐 zephyr）；上游 probe 用的 bit 22 在本板也能观测到
+  置位，但以 bit 18 + 哨兵校验为准。
+- **I/Q 位序**：维持上游文档口径（I bits 9:0，Q bits 19:10）；zephyr 主张相反。
+  C4 换 DIAG 总线路径时以实测裁定。
+- **采集耗时**：16380 字实测 ~636 µs（vendor adctrig 含内部校准开销），
+  高于理论 205 µs（80 MS/s）约 3 倍；引擎写速率实测 ~340 Mwords/s（原始寄存器
+  路径探针），速率字段在 rev v1.2 上的实际效果待 C4 一并厘清。
+- **AGCPWR_CTRL7 bit 23**：手动增益锁定后仍读 0，不能当"已强制"指示。
+- **SRAM 属主寄存器**（0x60095004）：复位值 0；位域与 PAC 一致
+  （SRAM_USAGE bits 11:8 一热 + MAC_DUMP_ALLOC bit 16）。
+
+## 9. USB-Serial/JTAG 主机侧语义（Windows 实测）
+
+- **DTR = IO0（BOOT 引脚）、RTS = 复位**（espflash connection/reset.rs 同结论）。
+  DTR=true 会进 ROM 下载监视器（打印 ESP-ROM 横幅后卡死等同步）。
+- 数据流与 DTR/RTS 电平无关；espflash reset_after_flash 的 USB-SJ 分支
+  （DTR=false + RTS 脉冲）是安全的复位进运行模式序列，host 工具已照抄。
+- **设备侧 TX 在无人读取时会卡死端点**：固件侧用有界非阻塞发送
+  （write_byte_nb + 500 ms 预算，超时丢帧下周期重试）规避。
+- 主机读取用 .NET SerialPort 或 serialport 均可；抓包诊断工具：
+  tools/serial_capture.ps1（连续抓 → 文件）、tools/serial_echo_test.ps1（回显）、
+  tools/probe_run.ps1（烧写+限时监控）。
+

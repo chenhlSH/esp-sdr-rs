@@ -12,7 +12,7 @@ docs/c5-registers.md），代码独立实现。
 |---|---|---|
 | C0 | workspace 骨架、钉死工具链、heartbeat、参考与 vendor 落地 | **完成**（上板验证通过） |
 | C1 | 射频点亮（PHY 启动、调谐、增益锁） | **完成**（上板验证通过） |
-| C2 | 突发采集 PoC + 主机频谱工具 | 未开始 |
+| C2 | 突发采集 PoC + 主机频谱工具 | **完成**（上板验证通过：12/12 帧 CRC 全对，频谱见真实空中信号） |
 | C3 | rtl_tcp 节拍流 | 未开始 |
 | C4 | 无缝流（诊断总线→PARLIO→GDMA→定点抽取） | 未开始 |
 | C5 | TX 发射 | 未开始 |
@@ -46,6 +46,11 @@ tools\espflash\espflash.exe flash -S -p COM4 target\riscv32imac-unknown-none-elf
 
 # 监控 defmt 日志（已验证；--elf 用于符号与地址解析）
 tools\espflash\espflash.exe monitor -S -p COM4 --elf target\riscv32imac-unknown-none-elf\release\heartbeat -L defmt --non-interactive
+
+# C2 采集验收流程（capburst 固件，40 s 抓包 → 文件解码 → 频谱 CSV）
+tools\espflash\espflash.exe flash -S -p COM4 target\riscv32imac-unknown-none-elf\release\capburst
+powershell -ExecutionPolicy Bypass -File tools\serial_capture.ps1 40 target\capture.bin
+target\release\esp-sdr-host.exe --file:target\capture.bin 12
 ```
 
 注意事项（Windows USB-Serial/JTAG）：

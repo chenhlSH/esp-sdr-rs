@@ -5,3 +5,4 @@ edition.workspace = true
 
 [dependencies]
 esp-sdr-shared = { path = "../shared" }
+serialport = "4.7.0"

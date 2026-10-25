@@ -8,7 +8,7 @@
 
 #![no_std]
 
-use core::ptr::read_volatile;
+use core::ptr::{read_volatile, write_volatile};
 
 use esp_sdr_shared::{frequency, gain};
 
@@ -64,12 +64,50 @@ unsafe extern "C" {
     fn phy_set_rxclk_en(arg: u32);
     /// C5 签名三参数：manual、增益码、保留 0（librftest.a）。
     fn force_rx_gain(manual: u32, gain_code: u32, reserved: u32);
+    /// 模拟前端信道设置（C5 直接收 MHz；libphy.a，nm 已验证）。
+    fn phy_chip_set_chan_ana(mhz: u32);
+    /// RX DC/增益表重校准（reference/esp-sdr common/rx_recalibration.c C5 分支）。
+    fn phy_set_rx_gain_cal_dc(a: u32, b: u32, table_a: *mut u8, table_b: *mut u8);
+    fn phy_adc_rate_cal_rxdc();
+    fn phy_set_rx_gain_table(mhz: u32, arg: u32);
+    /// PHY 参数表（libphy.a 全局，尺寸未知，按指针访问）。
+    static mut phy_param: u8;
+}
+
+/// C5 逐频点接收重校准（reference/esp-sdr common/rx_recalibration.c C5 分支）。
+///
+/// 上游 prepare_rx 在调谐前必调：不做这步，接收链 DC 工作点不随频率更新，
+/// 实测表现为捕获区恒定满幅样本（C2 现场证据）。必须持有射频锁。
+fn rx_recalibrate_locked(frequency_mhz: u32) {
+    // 释放手动增益位（AGCPWR_CTRL7 bit 23）：测量用的增益扫描不能被覆盖
+    unsafe {
+        let value = read_volatile(GAIN_STATUS_REGISTER as *const u32);
+        write_volatile(GAIN_STATUS_REGISTER as *mut u32, value & !(1 << 23));
+        phy_chip_set_chan_ana(frequency_mhz);
+    }
+    let phy_param_base = core::ptr::addr_of_mut!(phy_param);
+    let band = unsafe { phy_param_base.add(42).read() };
+    let flags = unsafe { phy_param_base.add(148) as *mut u32 };
+    // 保留 PHY 已装的 IQ 系数；只使 DC/增益表缓存过期（0x280 位）
+    unsafe {
+        *flags &= !0x280;
+        if band != 0 {
+            phy_set_rx_gain_cal_dc(0, 1, phy_param_base.add(384), phy_param_base.add(912));
+        } else {
+            phy_set_rx_gain_cal_dc(0, 1, phy_param_base.add(312), phy_param_base.add(896));
+            phy_adc_rate_cal_rxdc();
+            phy_set_rx_gain_cal_dc(1, 1, phy_param_base.add(348), phy_param_base.add(904));
+        }
+        *flags |= 0x480;
+        phy_set_rx_gain_table(frequency_mhz, 0);
+    }
 }
 
 /// C5 接收链准备序列（reference/esp-sdr families/c5_c6_c61/receiver.c prepare_rx）。
 ///
 /// 每次换频后必须重新执行。
 fn vendor_prepare_receive(frequency_mhz: u32, channel_bandwidth_mode: u32) {
+    rx_recalibrate_locked(frequency_mhz);
     unsafe {
         phy_set_chanfreq(frequency_mhz, channel_bandwidth_mode);
         phy_stop_tx_tone(1);

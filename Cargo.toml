@@ -20,6 +20,7 @@ defmt = "1.1"
 embassy-executor = "0.10.0"
 embassy-sync = "0.8.0"
 embassy-time = "0.5.0"
+embedded-io = "0.7.1"
 esp-alloc = "0.11.0"
 esp-backtrace = "0.20.0"
 esp-bootloader-esp-idf = "0.6.0"
@@ -27,8 +28,9 @@ esp-hal = { version = "1.2.2", features = ["defmt", "unstable"] }
 esp-println = "0.18.0"
 # esp-radio 1.0.0-beta.1 与 esp-hal 1.2.2 / esp-rtos 0.4.0 为同期配套发布；
 # 0.18.0 需要 esp-hal ~1.1，与 esp-rtos 0.4 互斥，故不用。
-esp-radio = { version = "=1.0.0-beta.1", features = ["esp-alloc"] }
+esp-radio = { version = "=1.0.0-beta.1", features = ["esp-alloc", "unstable", "sniffer"] }
 esp-rtos = { version = "0.4.0", features = ["embassy", "esp-radio"] }
+nb = "1.1"
 
 [profile.release]
 debug = true

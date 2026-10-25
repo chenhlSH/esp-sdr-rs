@@ -4,6 +4,7 @@ rustflags = [
     "-C", "link-arg=-Tlinkall.x",
     "-C", "link-arg=-Tdefmt.x",
     "-C", "force-frame-pointers",
+    "-C", "link-arg=-Map=target/sdr_map.ld",
 ]
 
 [env]

@@ -11,7 +11,6 @@ use embassy_sync::mutex::Mutex;
 use embassy_time::{Duration, Timer};
 use esp_alloc as _;
 use esp_backtrace as _;
-use esp_hal::timer::timg::TimerGroup;
 use esp_println as _;
 use esp_sdr_radio::Radio;
 
@@ -54,10 +53,9 @@ async fn main(spawner: Spawner) {
     defmt::info!("radio_check: boot");
 
     // esp-radio 要求：堆分配器 + 先启动调度器再初始化射频
-    esp_alloc::heap_allocator!(size: 64 * 1024);
-    esp_alloc::heap_allocator!(size: 36 * 1024);
+    esp_sdr_apps::init_heap();
 
-    let timer_group0 = TimerGroup::new(peripherals.TIMG0);
+    let timer_group0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timer_group0.timer0, peripherals.FROM_CPU_INTR0);
 
     // 点亮射频电源域与 PHY 校准：建立未启动的 WiFi 控制器（不关联、不收发）
