@@ -13,7 +13,7 @@ docs/c5-registers.md），代码独立实现。
 | C0 | workspace 骨架、钉死工具链、heartbeat、参考与 vendor 落地 | **完成**（上板验证通过） |
 | C1 | 射频点亮（PHY 启动、调谐、增益锁） | **完成**（上板验证通过） |
 | C2 | 突发采集 PoC + 主机频谱工具 | **完成**（上板验证通过：12/12 帧 CRC 全对，频谱见真实空中信号） |
-| C3 | rtl_tcp 节拍流 | 未开始 |
+| C3 | rtl_tcp 节拍流 | **完成**（USB 桥路线：60 秒连续 78 kS/s 零断流；WiFi 直连待上游修复 C5 SoftAP） |
 | C4 | 无缝流（诊断总线→PARLIO→GDMA→定点抽取） | 未开始 |
 | C5 | TX 发射 | 未开始 |
 
@@ -51,6 +51,12 @@ tools\espflash\espflash.exe monitor -S -p COM4 --elf target\riscv32imac-unknown-
 tools\espflash\espflash.exe flash -S -p COM4 target\riscv32imac-unknown-none-elf\release\capburst
 powershell -ExecutionPolicy Bypass -File tools\serial_capture.ps1 40 target\capture.bin
 target\release\esp-sdr-host.exe --file:target\capture.bin 12
+
+# C3 rtl_tcp 流（SDR++ / GNU Radio 连 127.0.0.1:1234，采样率设 250 kS/s）
+#   终端 1：桥（USB 流 → rtl_tcp 协议，C# 热路径）
+powershell -ExecutionPolicy Bypass -File tools\rtl_tcp_bridge.ps1 COM4 1234
+#   终端 2（可选验收）：60 秒连续性统计
+target\release\rtltcp_client.exe --rtltcp 127.0.0.1 60
 ```
 
 注意事项（Windows USB-Serial/JTAG）：

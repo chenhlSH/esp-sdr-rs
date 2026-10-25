@@ -5,10 +5,15 @@ edition.workspace = true
 
 [dependencies]
 defmt.workspace = true
+edge-dhcp.workspace = true
+edge-nal.workspace = true
+edge-nal-embassy.workspace = true
 embassy-executor.workspace = true
+embassy-net.workspace = true
 embassy-sync.workspace = true
 embassy-time.workspace = true
 embedded-io.workspace = true
+embedded-io-async.workspace = true
 esp-alloc.workspace = true
 esp-backtrace = { workspace = true, features = ["panic-handler", "defmt"] }
 esp-bootloader-esp-idf.workspace = true
@@ -20,6 +25,7 @@ esp-sdr-mmio = { path = "../esp-sdr-mmio" }
 esp-sdr-radio = { path = "../esp-sdr-radio" }
 esp-sdr-shared = { path = "../../shared" }
 nb.workspace = true
+static_cell.workspace = true
 
 # 目标芯片在构建期钉死为 ESP32-C5（workspace 唯一目标板）。
 [features]

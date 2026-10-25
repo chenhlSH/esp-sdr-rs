@@ -140,7 +140,27 @@ prepare_rx();
   （DTR=false + RTS 脉冲）是安全的复位进运行模式序列，host 工具已照抄。
 - **设备侧 TX 在无人读取时会卡死端点**：固件侧用有界非阻塞发送
   （write_byte_nb + 500 ms 预算，超时丢帧下周期重试）规避。
+- **serialport-rs 的 read 与 USB-SJ CDC 存在卡死兼容问题**（两案复现，
+  bridge 会话 5 s 后无数据）；.NET SerialPort 读同链路完全可靠——
+  桥的热路径用 Add-Type C#（含 .NET SerialPort）实现。
 - 主机读取用 .NET SerialPort 或 serialport 均可；抓包诊断工具：
   tools/serial_capture.ps1（连续抓 → 文件）、tools/serial_echo_test.ps1（回显）、
   tools/probe_run.ps1（烧写+限时监控）。
+
+## 10. C3 实测结论（esp-radio 1.0.0-beta.1 AP + 桥路线）
+
+- **C5 SoftAP 在 esp-radio 1.0.0-beta.1 上不发射信标**：官方未改动的
+  embassy_access_point 示例（同 tag、同工具链）在本板同样扫不到
+  （PC AX200 全段扫描）。与 Espressif esp-idf#19267（C5 SoftAP 信标
+  问题）呼应。固件侧 "rtltcp" bin（AP+TCP）代码保留，待上游修复后重测。
+- **混杂模式与 AP 冲突**：同控制器开 sniffer 会卡死网络栈（wait_config_up
+  不返回）；AP 模式本身让接收链持续在线，无需混杂模式。
+- **AP 模式下禁用 prepare_receive**：其 phy_pbus_xpd_tx_off 会停发信标
+  （AP 的信标是 TX）。AP 的接收增益由 PHY AGC 管理，不做手动锁。
+- **交付路线（C3 验收通过）**：capburst（USB 流，10 Hz 突发）→ PC 桥
+  （tools/rtl_tcp_bridge.ps1，C# 热路径）→ 本机 rtl_tcp 服务端 →
+  SDR++ 直连 127.0.0.1:1234。60 秒验收：9.37 MB、78 kS/s IQ8、
+  最大间隔 246 ms、零 CRC 错误。
+- USB-Serial/JTAG 有效吞吐实测 ~160-200 kB/s（IQ8 78 kS/s × 2 B），
+  低于理想 330 kB/s 峰值（突发间隙+USB 全速协议开销）。
 

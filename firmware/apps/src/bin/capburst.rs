@@ -25,7 +25,9 @@ esp_bootloader_esp_idf::esp_app_desc!();
 const FREQUENCY_MHZ: u32 = 2412;
 const GAIN_CODE: u32 = 40;
 const CAPTURE_WORD_COUNT: usize = 16380;
-const CAPTURE_PERIOD_MS: u64 = 1_000;
+/// 突发周期：USB-Serial/JTAG 实测 ~330 kB/s，每帧 IQ8 16 KB 约 50 ms，
+/// 100 ms 周期 ≈ 8.2 MS/s 等效交付（10 Hz 突发）。
+const CAPTURE_PERIOD_MS: u64 = 100;
 
 static RADIO: Mutex<embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex, Radio> =
     Mutex::new(Radio::new());
