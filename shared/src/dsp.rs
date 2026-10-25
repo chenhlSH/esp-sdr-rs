@@ -127,9 +127,54 @@ pub fn normalize(acc: i32, inverse: u32) -> i32 {
     ((i64::from(acc) * i64::from(inverse)) >> 32) as i32
 }
 
+/// diag 窗口位置上限（lsb 0..=6；zephyr ESP_SDR_DIAG_LSB_MAX）。
+pub const DIAG_LSB_MAX: u8 = 6;
+
+/// 从 10 bit I/Q 幅度直方图选 diag 窗口 lsb（espsoup pc_level 公式）。
+///
+/// hist 为 |x| 的计数（bin 0..=1023，I/Q 两路合计），total 为总样本数。
+/// peak 取 99.9% 点；robust 模式用中值 × 2.2 替代（FM 恒包络下突发
+/// （2.4 GHz Wi-Fi）会把 99.9% 点顶到 lsb 6——espsoup 实测 137 次失锁
+/// 的教训）。lsb 从 2 起：`7.5 * 2^lsb >= 1.15 * peak`，即 4 位码
+/// 不回绕也不浪费量程。
+#[must_use]
+pub fn diag_lsb_from_histogram(hist: &[u32; 1024], total: u32, robust: bool) -> u8 {
+    debug_assert!(total > 0);
+    let mut acc: u32 = 0;
+    let mut median = 1024u32;
+    let mut peak = 1024u32;
+    let have_median = total / 2;
+    let have_peak = total - total / 1000;
+    for (value, &count) in hist.iter().enumerate() {
+        acc = acc.saturating_add(count);
+        if median == 1024 && acc >= have_median {
+            median = value as u32;
+        }
+        if acc >= have_peak {
+            peak = value as u32;
+            break;
+        }
+    }
+    if robust {
+        // 中值 × 2.2（含噪声裕量），不超过实测 peak
+        let from_median = (median * 22 / 10).min(peak);
+        if from_median > 0 {
+            peak = from_median;
+        }
+    }
+    let mut lsb: u8 = 2;
+    while lsb < DIAG_LSB_MAX && (15u32 << lsb) < peak.saturating_mul(23) / 10 {
+        lsb += 1;
+    }
+    lsb
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{box16, cic_inverse, normalize, Cic, CIC_R_MAX, CIC_R_MIN, DIAG_BOX};
+    use super::{
+        box16, cic_inverse, diag_lsb_from_histogram, normalize, Cic, CIC_R_MAX, CIC_R_MIN,
+        DIAG_BOX,
+    };
 
     #[test]
     fn box16_zero_and_extremes() {
@@ -230,5 +275,37 @@ mod tests {
         assert_eq!(cic_inverse(8, 0), 8_388_608);
         // 范围约束成立
         assert!(CIC_R_MIN <= 10 && 10 <= CIC_R_MAX);
+    }
+
+    #[test]
+    fn lsb_selection() {
+        // 小信号（|x| 峰 ~20）：peak*1.15=23，7.5*2^2=30 ≥ 23 → lsb 2
+        let mut hist = [0u32; 1024];
+        for value in 0..20 {
+            hist[value] = 10;
+        }
+        hist[19] += 10; // 99.9% 点在 19-20 之间
+        let total: u32 = hist.iter().sum();
+        assert_eq!(diag_lsb_from_histogram(&hist, total, false), 2);
+
+        // 满量程信号（|x| 峰 ~500）：需要 lsb 6（7.5*2^6=480）
+        let mut big = [0u32; 1024];
+        for value in 0..500 {
+            big[value] = 10;
+        }
+        let total_big: u32 = big.iter().sum();
+        assert_eq!(diag_lsb_from_histogram(&big, total_big, false), 6);
+
+        // robust：主体中值 ~20 + 1% 突发到 1000（非 robust 的 99.9% 点
+        // 被突发顶到 1000 → lsb 6；robust 用中值 20×2.2=44 →
+        // 44*1.15≈101 → lsb 3（15<<3=120 ≥ 101））
+        let mut bursty = [0u32; 1024];
+        for value in 0..41 {
+            bursty[value] = 999;
+        }
+        bursty[1000] = 1000; // ≈1% 突发
+        let total_bursty: u32 = bursty.iter().sum();
+        assert_eq!(diag_lsb_from_histogram(&bursty, total_bursty, false), 6);
+        assert_eq!(diag_lsb_from_histogram(&bursty, total_bursty, true), 3);
     }
 }

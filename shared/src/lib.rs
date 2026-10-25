@@ -62,6 +62,10 @@ pub mod gain {
 pub mod frame {
     pub const MAGIC: [u8; 4] = *b"C5IQ";
     pub const CAPTURE_FRAME_TYPE: u8 = 1;
+    /// C4 无缝流帧：载荷为 IQ8 字节流（I,Q 交错，每字节独立削减位数）。
+    /// sample_word_count 语义为帧内 IQ 样本对数；rate_index 对流帧无效
+    /// （固定 0），实际速率由发送端配置（box16 + CIC 抽取比）决定。
+    pub const STREAM_FRAME_TYPE: u8 = 2;
     /// 帧头定长：4 magic + 1 type + 1 rate + 2 sequence + 2 word_count + 2 reserved
     ///          + 4 frequency_mhz + 4 elapsed_us + 4 crc32 = 24。
     pub const HEADER_LEN: usize = 24;
@@ -114,7 +118,7 @@ pub mod frame {
                 return Err(FrameError::BadMagic);
             }
             let frame_type = bytes[4];
-            if frame_type != CAPTURE_FRAME_TYPE {
+            if frame_type != CAPTURE_FRAME_TYPE && frame_type != STREAM_FRAME_TYPE {
                 return Err(FrameError::BadFrameType);
             }
             Ok(Self {

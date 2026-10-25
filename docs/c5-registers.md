@@ -230,20 +230,22 @@ IDF 驱动（espsoup PCAP/PRUN）的 partial_rx_en + eof_data_len=ring
 写 rx_data_cfg，再 reg_update（对齐 zephyr parlio_start 顺序）。
 满足时序后同一 svd2rust 写法 readback bitlen=0x70000 ✓。
 
-**esp-hal 1.2.2 在 C5 上的四个缺口（该版本官方流式路径实际不可用）：**
+**esp-hal 1.2.2 在 C5 上的三个缺口（该版本官方流式路径实际不可用；
+详细上报口径见 docs/upstream-issues.md，其中原"缺口 4"经复核撤销）：
 1. `ParlIoRx::read` → `do_prepare` 强制 `indscr_burst_en(true)`，
    软件链（DmaRxStreamBuf 链尾 next=NULL）启动即报 in_dscr_err
    （C5 的 AHB-GDMA 把 NULL next 判为描述符错误，不是"链尾暂停"）。
    inlink_restart 救不回（错误态需 in_rst 通道复位）。
 2. `ahb_v2 setup()` 的 DMA 可访问内存窗口配置整段被注释（TODO），
-   `INTR_MEM_START/END_ADDR` 复位 0/0 → 数据写越界报 dscr_err。
-   需手工写 0x40800000/0x44000000（zephyr/IDF set_default_memory_range）。
+   `INTR_MEM_START/END_ADDR` PAC 标注复位 0/0。注意：B 轮实测未写
+   窗口时 DMA 仍能完成描述符（硅默认行为与 PAC 复位值矛盾，另行
+   核对）；IDF/zephyr 每次初始化都显式写 0x40800000/0x44000000。
 3. `apply_clock_divider` off-by-one：直分频语义写 div_num=source/freq，
    C5 实际语义 integer-1（hal fork parlio_ll）。请求 40 MHz 得
    div_num=6 → 实际 34.29 MB/s（实测裁定）；要 40 MHz 须 div_num=5
-   （PAC 直改或请求 48 MHz——但 >40 撞 esp-hal 上限检查，只能直改）。
-4. read()/with_config 不覆盖 rx_timeout_en（RX_GENRL_CFG 复位
-   0x21FFE000 的 bit29 默认开）——数据间隙触发超时 error EOF。
+   （PAC 直改——请求 48 MHz 会撞 esp-hal 上限检查）。
+（撤销的"缺口 4"：rx_timeout_en 其实由 RxConfig::default 的
+timeout_ticks=None 经 apply_config 正确关闭，只影响裸路径。）
 
 **espsoup 0.7.1 预编译固件（rev1.2 板实测，烧写三件套
 reference/espsoup-bin/）**：PDIAG 2000 读 → MODEM_DIAG[19:0] 每信号
@@ -269,13 +271,28 @@ N espsoup 烧板裁判（PDIAG/PCAP/PRUN）→ 硅无罪。O bitlen readback
 但需验证其 bitlen readback（diagprobe 旧轮显示 0——同为时序受害者）；
 start() 里补 intr_mem 窗口写入；确认 auto_ret 未被显式清零。
 
-### 10.3 下一步（C4 剩余）
+### 10.3 C4 管线落地实录（回灌后，60 秒上板验证）
 
-- diagprobe2 手工序列固化进 mmio（替换/融合 diag.rs 裸路径），
-  上 60 秒验收 + CIC 消费任务 + IQ8 流帧。
-- lsb 自动选窗（espsoup 99.9% 幅度法+中值×2.2 抗突发）。
-- WiFi 混杂过滤器清零（run 期）+ 每 run 前 DC 校准（espsoup 教训）。
-- 60 秒验收目标：40 MB/s 零索引跳变（PRUN 已证硬件可达）。
+- **mmio 回灌**：DiagStream::start 重写为验证过的 zephyr 顺序（PARLIO
+  配置在前 → GDMA armed → 启动三连）+ bitlen 写入断言（时序不满足时
+  响亮崩溃）。回灌踩两坑（如实入档）：(a) 时钟源 sel 须在 en=true
+  状态下建立（对齐 esp-hal PeripheralGuard 行为），en=false 下写入
+  实测不生效 → 0 字节；(b) 裸路径必须显式开 PCR `gdma_conf.gdma_clk_en`
+  （手工路径由 esp-hal PeripheralGuard 代办，缺它 DMA 寄存器写入
+  全部无效——诊断特征：conf/link/addr 读回全零）。
+- **diagstream 交付 bin**（60 秒上板）：lsb 自动选窗（burst 快照直方图
+  + robust 中值）→ WiFi 混杂过滤器清零（FFI `esp_wifi_set_promiscuous_filter`，
+  espsoup pe_quiet_wifi 教训）→ 无缝流 → box16+CIC(R=32) → IQ8 流帧
+  （type 2，512 对/帧）→ USB 小批量穿插发送。实测：**生产 2.4 GB
+  （40.0 MB/s 满速）、消费 544 MB（9.07 MB/s）、2075 帧零丢零跳**。
+- **已知瓶颈（下一轮）**：消费速率 9.07 MB/s 低于生产 40 MB/s——
+  消费落后导致环内数据被覆盖（时域跳变，skipped 未计因 poll 及时）。
+  嫌疑：RV32 无硬件除法，消费循环内 64 位取模（`% RING_BYTES`、
+  `% IQ8_RING`）是软件除法热点；box16 的逐字节组装（from_le_bytes）
+  也可换对齐 u32 加载。优化目标：消费 ≥40 MB/s（cycles/byte 对照
+  6.0 预算）。IQ8 环已是 2 的幂，改位与；RING_BYTES 游标改增量回绕。
+- **DC 校准**（espsoup dc_cal：PBUS debugmode + Newton 步进）暂缓：
+  DC 仅占窗 ~1/16，lsb 留裕量即可；正式版前再上。
 
 - **C5 SoftAP 在 esp-radio 1.0.0-beta.1 上不发射信标**：官方未改动的
   embassy_access_point 示例（同 tag、同工具链）在本板同样扫不到

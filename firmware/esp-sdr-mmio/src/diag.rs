@@ -335,19 +335,10 @@ impl DiagStream {
         // ---- 环与描述符 ----
         ring_init();
 
-        // ---- GDMA：AHB 组通道 0，触发 PARLIO ----
-        // 每次启动都做总线复位脉冲（zephyr gdma_ll_reset_register /
-        // parlio_ll_reset_register）：不清残留的 inlink 指针/FIFO 状态，
-        // 重启后链表只走一个描述符就停（C4 实测）。
-        pcr.gdma_conf().modify(|_, w| {
-            w.gdma_clk_en().bit(true);
-            w.gdma_rst_en().bit(true);
-            w
-        });
-        pcr.gdma_conf().modify(|_, w| {
-            w.gdma_rst_en().bit(false);
-            w
-        });
+        // ---- PARLIO RX 配置（先于 DMA：zephyr 顺序，diagprobe2 16 轮验证）----
+        // 顺序敏感：rx_data_cfg 的 bitlen 必须在时钟域/FIFO 复位与时钟
+        // 关闭之后、reg_update 之前写入（否则字段静默不生效——C4 实测）。
+        // PCR 总线复位（zephyr parlio_ll_reset_register）
         pcr.parl_io_conf().modify(|_, w| {
             w.parl_clk_en().bit(true);
             w.parl_rst_en().bit(true);
@@ -357,51 +348,19 @@ impl DiagStream {
             w.parl_rst_en().bit(false);
             w
         });
-        dma.misc_conf().modify(|_, w| {
-            w.clk_en().bit(true);
+        // 时钟源先建立（对齐 esp-hal PeripheralGuard 行为：en=true 状态下
+        // 写 sel。sel 在 en=false 下写入实测不生效——回灌首版 0 字节，
+        // 时钟源未切到 PLL_F240M 则无采样时钟）。
+        pcr.parl_clk_rx_conf().modify(|_, w| unsafe {
+            w.parl_clk_rx_en().bit(true);
+            w.parl_clk_rx_sel().bits(2); // PLL_F240M
             w
         });
-        dma.intr_mem_start_addr().write(|w| unsafe { w.bits(0x4080_0000) });
-        dma.intr_mem_end_addr().write(|w| unsafe { w.bits(0x4400_0000) });
-        let ch = dma.ch(0);
-        ch.in_conf0().modify(|_, w| {
-            w.in_rst().bit(true);
-            w
-        });
-        ch.in_conf0().modify(|_, w| {
-            w.in_rst().bit(false);
-            w
-        });
-        ch.in_conf1().modify(|_, w| {
-            w.in_check_owner().bit(false);
-            w
-        });
-        ch.in_peri_sel().modify(|_, w| unsafe {
-            w.peri_in_sel().bits(DMA_TRIGGER_PARLIO);
-            w
-        });
-        dma.in_int_ch(0).clr().write(|w| unsafe { w.bits(u32::MAX) });
-        dma.in_link_addr_ch(0)
-            .write(|w| unsafe { w.bits(DESC_ADDRESS) });
-        // 实验组合（C4-A 末轮）：环形链自动重启 + 通道最高优先级 + 关加权仲裁
-        dma.ch(0).in_link().modify(|_, w| {
-            w.inlink_auto_ret().bit(true);
-            w
-        });
-        dma.ch(0).in_pri().modify(|_, w| unsafe {
-            w.rx_pri().bits(7);
-            w
-        });
-        dma.weight_en().modify(|_, w| {
-            w.weight_en().bit(false);
-            w
-        });
-        ch.in_link().modify(|_, w| {
-            w.inlink_start().bit(true);
-            w
-        });
-
-        // ---- PARLIO RX：PLL_F240M / 6 = 40 MHz，8 位，软分隔符 ----
+        let mut settle = 0;
+        while settle < 100 {
+            settle += 1;
+        }
+        // RX 时钟域复位 + FIFO 复位（zephyr rx_reset_clock / rx_reset_fifo）
         pcr.parl_clk_rx_conf().modify(|_, w| {
             w.parl_rx_rst_en().bit(true);
             w
@@ -426,24 +385,36 @@ impl DiagStream {
             w.rx_start().bit(false);
             w
         });
+        // PLL_F240M / 6 = 40 MHz（div_num 语义 integer-1，PRUN 实测 ppm 1.5）
         pcr.parl_clk_rx_conf().modify(|_, w| unsafe {
-            w.parl_clk_rx_sel().bits(2); // PLL_F240M
+            w.parl_clk_rx_sel().bits(2);
             w
         });
         pcr.parl_clk_rx_conf().modify(|_, w| unsafe {
-            w.parl_clk_rx_div_num().bits(5); // 240/(5+1) = 40 MHz
+            w.parl_clk_rx_div_num().bits(5);
             w
         });
+        // 软分隔符：期望位长 = 环总位（19 位字段；EOF=RX_FULL 在 bitlen 处，
+        // 每圈一个 EOF + auto_ret 回链头 = 无限流的引擎，C4 破案关键）
         parlio.rx_data_cfg().write(|w| unsafe {
             w.rx_bus_wid_sel().bits(3); // 8 位
             w.rx_bitlen().bits((RING_BYTES * 8) as u32);
             w.rx_data_order_inv().bit(false); // LSB 先行
             w
         });
+        // 写入断言：bitlen 字段读回必须等于期望值（时序不满足时静默为 0，
+        // 流会在 0-4 个描述符后停——C4 实测，响亮崩溃优于静默错流）
+        let data_cfg = parlio.rx_data_cfg().read().bits();
+        assert!(
+            (data_cfg >> 9) & 0x7_FFFF == (RING_BYTES * 8) as u32,
+            "rx_bitlen write lost: rx_data_cfg=0x{:08x}",
+            data_cfg
+        );
+        // EOF=RX_FULL + 超时关（复位默认开：数据间隙触发 error EOF）+ gating 关
         parlio.rx_genrl_cfg().modify(|_, w| {
             w.rx_gating_en().bit(false);
             w.rx_timeout_en().bit(false);
-            w.rx_eof_gen_sel().bit(false); // EOF = RX_FULL（软分隔符在 bitlen 处）
+            w.rx_eof_gen_sel().bit(false);
             w
         });
         parlio.rx_clk_cfg().write(|w| {
@@ -466,7 +437,57 @@ impl DiagStream {
             spin += 1;
         }
 
-        // ---- 启动顺序（zephyr：DMA 先就位 → 单元 → 时钟 → 软分隔符）----
+        // ---- GDMA：AHB 组通道 0，触发 PARLIO（DMA armed 在单元启动前）----
+        // PCR 总线时钟必须先开（手工验证路径由 esp-hal PeripheralGuard
+        // 代办；裸路径缺它则 DMA 寄存器写入全部无效——C4 回灌实测全零）
+        pcr.gdma_conf().modify(|_, w| {
+            w.gdma_clk_en().bit(true);
+            w.gdma_rst_en().bit(true);
+            w
+        });
+        pcr.gdma_conf().modify(|_, w| {
+            w.gdma_rst_en().bit(false);
+            w
+        });
+        dma.misc_conf().modify(|_, w| {
+            w.clk_en().bit(true);
+            w
+        });
+        // 可访问内存窗口（复位为空 = 任何写都报 dscr_err；esp-hal 的 C5
+        // setup() 未配置此项——注释掉的 TODO）
+        dma.intr_mem_start_addr().write(|w| unsafe { w.bits(0x4080_0000) });
+        dma.intr_mem_end_addr().write(|w| unsafe { w.bits(0x4400_0000) });
+        let ch = dma.ch(0);
+        ch.in_conf0().modify(|_, w| {
+            w.in_rst().bit(true);
+            w
+        });
+        ch.in_conf0().modify(|_, w| {
+            w.in_rst().bit(false);
+            w
+        });
+        ch.in_conf1().modify(|_, w| {
+            w.in_check_owner().bit(false);
+            w
+        });
+        ch.in_peri_sel().modify(|_, w| unsafe {
+            w.peri_in_sel().bits(DMA_TRIGGER_PARLIO);
+            w
+        });
+        dma.in_int_ch(0).clr().write(|w| unsafe { w.bits(u32::MAX) });
+        dma.in_link_addr_ch(0)
+            .write(|w| unsafe { w.bits(DESC_ADDRESS) });
+        // EOF 后自动回链头（复位默认 1，显式写出意图）
+        dma.ch(0).in_link().modify(|_, w| {
+            w.inlink_auto_ret().bit(true);
+            w
+        });
+        ch.in_link().modify(|_, w| {
+            w.inlink_start().bit(true);
+            w
+        });
+
+        // ---- 启动三连（zephyr：单元 → 时钟 → 软分隔符）----
         parlio.rx_start_cfg().write(|w| {
             w.rx_start().bit(true);
             w
@@ -526,6 +547,29 @@ impl DiagStream {
     #[must_use]
     pub fn producer_bytes(&self) -> u64 {
         self.producer_bytes
+    }
+
+    /// 自 consumed_bytes 起的环内连续可读长度（不跨环尾；消费侧零拷贝
+    /// 分段依据）。consumed 不得超过生产计数。
+    #[must_use]
+    pub fn contiguous_available(&self, consumed_bytes: u64) -> usize {
+        assert!(
+            consumed_bytes <= self.producer_bytes,
+            "consumer ahead of producer"
+        );
+        let available = self.producer_bytes - consumed_bytes;
+        let ring_offset = (consumed_bytes % RING_BYTES as u64) as usize;
+        let to_ring_end = RING_BYTES - ring_offset;
+        available.min(to_ring_end as u64) as usize
+    }
+
+    /// 自 consumed_bytes 起 len 字节的环内切片（len 须 ≤
+    /// [Self::contiguous_available]；调用方消费后推进自身游标）。
+    #[must_use]
+    pub fn ring_slice(&self, consumed_bytes: u64, len: usize) -> &[u8] {
+        let ring_offset = (consumed_bytes % RING_BYTES as u64) as u32;
+        assert!(len <= self.contiguous_available(consumed_bytes));
+        unsafe { core::slice::from_raw_parts((RING_ADDRESS + ring_offset) as *const u8, len) }
     }
 
     /// 环内某块的零拷贝视图（block_index 以 BLOCK_BYTES 为单位）。
