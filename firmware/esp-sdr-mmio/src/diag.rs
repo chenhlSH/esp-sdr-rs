@@ -29,7 +29,6 @@ const DUMP_CTRL_REG: u32 = 0x600a_9004;
 const DUMP_CTRL_RUN: u32 = 1 << 31;
 const DUMP_CTRL_TRIGGER: u32 = 1 << 19;
 const DUMP_CTRL_DONE: u32 = 1 << 18;
-const DUMP_CTRL_COUNT_MASK: u32 = 0x0001_FFFF;
 const DUMP_MODE_REG: u32 = 0x600a_9008;
 const DUMP_MODE_RATE_MASK: u32 = 0x7 << 21;
 const DUMP_MODE_SOURCE_MASK: u32 = 0xF << 17;
@@ -218,11 +217,63 @@ extern "C" fn esp_sdr_diag_dma_isr() {
     }
 }
 
+/// 启动诊断总线数据源：dump engine 自由运行（无尽计数）+ 8 pad 回环的
+/// 输出侧。PARLIO/GDMA 由调用方配置——裸路径见 [DiagStream::start]，
+/// esp-hal 驱动路径（parl_io::ParlIoRx + DmaRxStreamBuf）由应用层直接
+/// 使用 esp-hal API。返回 usage_saved 供 [diag_bus_stop] 归还。
+///
+/// 前置条件：射频已点亮（混杂模式开启，接收链在线）。
+pub fn diag_bus_start(lsb: u8) -> u32 {
+    // ---- dump engine 自由运行（zephyr esp_sdr_diag_run 序列）----
+    let usage_saved = rd(DUMP_USAGE_REG);
+    wr(DUMP_CTRL_REG, 0);
+    wr(DUMP_CLK_FORCE_REG, u32::MAX);
+    let clk_en = rd(DUMP_CLK_EN_REG);
+    wr(DUMP_CLK_EN_REG, clk_en | DUMP_CLK_EN_BIT);
+    let lane = rd(DUMP_CONFIG_REG);
+    wr(DUMP_CONFIG_REG, (lane & !DUMP_CONFIG_LANES_MASK) | DUMP_CONFIG_IQ);
+    let mode = rd(DUMP_MODE_REG);
+    wr(DUMP_MODE_REG, (mode & !DUMP_MODE_SOURCE_MASK) | DUMP_MODE_SOURCE_IQ);
+    // 让渡：bits 11:8=块 1 + bit16（zephyr 的 MAC_DUMP_ALLOC 位；
+    // espsoup 语义为半区选择=1→上半区，两种命名同一位，置 1 为实测工作态）
+    wr(
+        DUMP_USAGE_REG,
+        (usage_saved & !DUMP_USAGE_FIELD_MASK) | DUMP_USAGE_BANK1 | 1 << 16,
+    );
+    riscv_fence();
+    let _flush = rd(DUMP_USAGE_REG);
+    // 速率字段清零 + 无尽计数触发
+    let mode = rd(DUMP_MODE_REG);
+    wr(DUMP_MODE_REG, mode & !DUMP_MODE_RATE_MASK);
+    let ctrl = DUMP_CTRL_RUN | DUMP_ENDLESS;
+    wr(DUMP_CTRL_REG, DUMP_ENDLESS | DUMP_CTRL_DONE);
+    wr(DUMP_CTRL_REG, ctrl);
+    wr(DUMP_CTRL_REG, ctrl | DUMP_CTRL_TRIGGER);
+    wr(DUMP_CTRL_REG, ctrl);
+    // 块 1 立即交还 CPU：环与描述符住在下半区
+    wr(DUMP_USAGE_REG, usage_saved);
+    riscv_fence();
+    let _flush = rd(DUMP_USAGE_REG);
+
+    // ---- pad 回环 ----
+    pads_route(u32::from(lsb));
+    usage_saved
+}
+
+/// 停止诊断总线数据源（[diag_bus_start] 的配对收尾）。
+pub fn diag_bus_stop(usage_saved: u32) {
+    pads_release();
+    wr(DUMP_CTRL_REG, 0);
+    wr(DUMP_USAGE_REG, usage_saved);
+    riscv_fence();
+    let _flush = rd(DUMP_USAGE_REG);
+}
+
 impl DiagStream {
     /// 启动无缝流（中断驱动版：GDMA in_done ISR 推进生产计数，
     /// zephyr 原路径的忠实复刻）。前置条件与 [Self::start] 相同。
     pub fn start_with_isr(lsb: u8) -> Self {
-        let mut stream = Self::start(lsb);
+        let stream = Self::start(lsb);
         // start 内已做过一轮总线复位/配置；此处补中断绑定与使能
         ISR_HEAD.store(0, core::sync::atomic::Ordering::Relaxed);
         ISR_BYTES_LO.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -242,18 +293,11 @@ impl DiagStream {
             esp_sdr_diag_dma_isr,
             esp_hal::interrupt::Priority::Priority1,
         );
-        unsafe {
-            esp_hal::interrupt::bind_handler(
-                esp32c5::Interrupt::DMA_IN_CH0,
-                handler,
-            );
-        }
-        unsafe {
-            esp_hal::interrupt::enable(
-                esp32c5::Interrupt::DMA_IN_CH0,
-                esp_hal::interrupt::Priority::Priority1,
-            );
-        }
+        esp_hal::interrupt::bind_handler(esp32c5::Interrupt::DMA_IN_CH0, handler);
+        esp_hal::interrupt::enable(
+            esp32c5::Interrupt::DMA_IN_CH0,
+            esp_hal::interrupt::Priority::Priority1,
+        );
         stream
     }
 
@@ -285,39 +329,8 @@ impl DiagStream {
         let parlio = unsafe { esp32c5::PARL_IO::steal() };
         let dma = unsafe { esp32c5::DMA::steal() };
 
-        // ---- dump engine 自由运行（zephyr esp_sdr_diag_run 序列，实测最优基线）----
-        let usage_saved = rd(DUMP_USAGE_REG);
-        wr(DUMP_CTRL_REG, 0);
-        wr(DUMP_CLK_FORCE_REG, u32::MAX);
-        let clk_en = rd(DUMP_CLK_EN_REG);
-        wr(DUMP_CLK_EN_REG, clk_en | DUMP_CLK_EN_BIT);
-        let lane = rd(DUMP_CONFIG_REG);
-        wr(DUMP_CONFIG_REG, (lane & !DUMP_CONFIG_LANES_MASK) | DUMP_CONFIG_IQ);
-        let mode = rd(DUMP_MODE_REG);
-        wr(DUMP_MODE_REG, (mode & !DUMP_MODE_SOURCE_MASK) | DUMP_MODE_SOURCE_IQ);
-        // 让渡：bits 11:8=块 1 + bit16（zephyr 的 MAC_DUMP_ALLOC 位；
-        // espsoup 语义为半区选择=1→上半区，两种命名同一位，置 1 为实测工作态）
-        wr(
-            DUMP_USAGE_REG,
-            (usage_saved & !DUMP_USAGE_FIELD_MASK) | DUMP_USAGE_BANK1 | 1 << 16,
-        );
-        riscv_fence();
-        let _flush = rd(DUMP_USAGE_REG);
-        // 速率字段清零 + 无尽计数触发
-        let mode = rd(DUMP_MODE_REG);
-        wr(DUMP_MODE_REG, mode & !DUMP_MODE_RATE_MASK);
-        let ctrl = DUMP_CTRL_RUN | DUMP_ENDLESS;
-        wr(DUMP_CTRL_REG, DUMP_ENDLESS | DUMP_CTRL_DONE);
-        wr(DUMP_CTRL_REG, ctrl);
-        wr(DUMP_CTRL_REG, ctrl | DUMP_CTRL_TRIGGER);
-        wr(DUMP_CTRL_REG, ctrl);
-        // 块 1 立即交还 CPU：环与描述符住在下半区
-        wr(DUMP_USAGE_REG, usage_saved);
-        riscv_fence();
-        let _flush = rd(DUMP_USAGE_REG);
-
-        // ---- pad 回环 ----
-        pads_route(u32::from(lsb));
+        // ---- dump engine 自由运行 + pad 回环（与驱动路径共用）----
+        let usage_saved = diag_bus_start(lsb);
 
         // ---- 环与描述符 ----
         ring_init();
@@ -549,12 +562,7 @@ impl DiagStream {
         });
         dma.in_int_ch(0).clr().write(|w| unsafe { w.bits(u32::MAX) });
 
-        pads_release();
-
-        wr(DUMP_CTRL_REG, 0);
-        wr(DUMP_USAGE_REG, self.usage_saved);
-        riscv_fence();
-        let _flush = rd(DUMP_USAGE_REG);
+        diag_bus_stop(self.usage_saved);
         self.running = false;
     }
 }

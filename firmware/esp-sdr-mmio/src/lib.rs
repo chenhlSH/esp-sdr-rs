@@ -288,7 +288,7 @@ pub use hardware::{assert_stack_clear_of_dump_bank, DumpEngine};
 #[cfg(target_arch = "riscv32")]
 pub mod diag;
 #[cfg(target_arch = "riscv32")]
-pub use diag::{DiagStream, BLOCK_BYTES, DIAG_PINS, RING_BYTES};
+pub use diag::{DiagStream, BLOCK_BYTES, DIAG_PINS, RING_BYTES, diag_bus_start, diag_bus_stop};
 
 #[cfg(test)]
 mod tests {

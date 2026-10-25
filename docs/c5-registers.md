@@ -204,15 +204,78 @@ owner 不归还（已加 zephyr 同款归还）、总线复位脉冲、通道优
 11. DMA 侧无额外魔法：GDMA 全部经 IDF gdma 驱动（申请通道、默认
     内存范围、owner check off、RX_DONE 中断）。
 
-### 10.2 下一步（option A 已获批）
+### 10.2 option A 实录（esp-hal 驱动路径，16 轮实验，2026-10-25 破案）
 
-换 **esp-hal 官方 PARLIO/GDMA 驱动路径**（对齐 espsoup 的 IDF 驱动
-用法，产出跨实现数据点）：
-- esp-hal `parl_io::ParlIoRx` + `DmaRxStreamBuf`（流式 RX）；
-- 时钟源：查 esp-hal PARLIO 是否支持内部 PLL 时钟（RxClkInPin 是
-  外部引脚泛型——若仅支持外部时钟，需评估时钟输出回环或保留裸路径）；
-- 数据线：`RxDataPins` 8 位（GPIO 0,1,3,4,5,7,10,23）；
-- 失败再按指示逐项 diff hal fork 的 ahb_dma_ll.h / 内联汇编对照。
+**结论先行：C4 无缝流数据面已打通**——diagprobe2 实测 **40.0 MB/s 持续
+5 秒（200 MB）零重启**，与 espsoup PRUN 完全对齐。根因两个，均与
+"环形链纯软件回环"的假设有关：
+
+**根因 1（命脉）：rx_bitlen 软分隔符 EOF 是环形无限流的引擎。**
+正确机制 = `rx_bitlen = 环总位长（bits9:27，19 位，单位 bit）` +
+`rx_eof_gen_sel = 0（RX_FULL：bitlen 处生成 EOF）` +
+`inlink_auto_ret = 1（IN_LINK 复位默认 0x11 的 bit0，EOF 后 GDMA
+自动回链头重启）`。每圈 PARLIO 生成 EOF → GDMA 收 suc_eof 结束当圈
+→ auto_ret 回 desc[0] 开下一圈。**纯软件环（无 EOF 让 DMA 沿 next
+无限走）在本板（rev v1.2）不成立**：DMA 预取队列耗尽后停（表现为
+随机生产 0-4 个描述符后 in_dscr_err/in_dscr_empty 粘滞死，
+inlink_restart 无效）。zephyr（rev1.0 板）的环与之表面相同，但其
+bitlen 写入成功故有 EOF 引擎；我们此前 rx_data_cfg 的 bitlen 一直
+没写进去（readback bits9:27=0）——**根因 2**。
+IDF 驱动（espsoup PCAP/PRUN）的 partial_rx_en + eof_data_len=ring
+正是同一机制（ISR 只推进软件游标，不碰 DMA 寄存器）。
+
+**根因 2（陷阱）：rx_data_cfg 的 bitlen 写入依赖时序。** bitlen
+写不进并非值越界（458752 < 19 位上限 524287），而是**写入时序**：
+必须在 PCR rx 时钟域复位脉冲 + FIFO 复位 + `parl_clk_rx_en=0` 之后
+写 rx_data_cfg，再 reg_update（对齐 zephyr parlio_start 顺序）。
+满足时序后同一 svd2rust 写法 readback bitlen=0x70000 ✓。
+
+**esp-hal 1.2.2 在 C5 上的四个缺口（该版本官方流式路径实际不可用）：**
+1. `ParlIoRx::read` → `do_prepare` 强制 `indscr_burst_en(true)`，
+   软件链（DmaRxStreamBuf 链尾 next=NULL）启动即报 in_dscr_err
+   （C5 的 AHB-GDMA 把 NULL next 判为描述符错误，不是"链尾暂停"）。
+   inlink_restart 救不回（错误态需 in_rst 通道复位）。
+2. `ahb_v2 setup()` 的 DMA 可访问内存窗口配置整段被注释（TODO），
+   `INTR_MEM_START/END_ADDR` 复位 0/0 → 数据写越界报 dscr_err。
+   需手工写 0x40800000/0x44000000（zephyr/IDF set_default_memory_range）。
+3. `apply_clock_divider` off-by-one：直分频语义写 div_num=source/freq，
+   C5 实际语义 integer-1（hal fork parlio_ll）。请求 40 MHz 得
+   div_num=6 → 实际 34.29 MB/s（实测裁定）；要 40 MHz 须 div_num=5
+   （PAC 直改或请求 48 MHz——但 >40 撞 esp-hal 上限检查，只能直改）。
+4. read()/with_config 不覆盖 rx_timeout_en（RX_GENRL_CFG 复位
+   0x21FFE000 的 bit29 默认开）——数据间隙触发超时 error EOF。
+
+**espsoup 0.7.1 预编译固件（rev1.2 板实测，烧写三件套
+reference/espsoup-bin/）**：PDIAG 2000 读 → MODEM_DIAG[19:0] 每信号
+~1000 翻转/占空比 ~50%（总线活跃铁证）；PCAP 4096/32768/65532 全成功
+（1/9/17 nodes）；**PRUN 8 秒 40.0 MB/s、overrun 1 次、时钟偏差
+ppm=1.5、guard 0/18432（dump 引擎不踩 CPU 拥有的块 1）**。espsoup
+的连续流 = PCAP 式快照 + PRUN 无限环（IDF partial 模式），另外它每
+run 前做 DC 校准、run 期间清 WiFi 混杂过滤器（防驱动任务抢占过跑）。
+
+**16 轮实验时间线**（负结果同样入档）：A read() 直接调 →
+DescriptorError panic（burst+NULL）。B 加诊断 → armed 但 0 字节、
+int=0x9。C 补窗口寄存器 → read 内部检查抓 dscr_err。D 手工启动+闭环
++关 burst → 14336 后 empty。E 闭环+view.pop+重连 → 57344 卡死（view
+顺序扫描与 DMA park 失步）。F 顺序链（尾 NULL）→ 0 字节+dscr_err
+（NULL=错误实锤）。G 裸 owner 消费 → 7168。H 关 check_owner →
+dscr_err 消失但吞吐被 dump 日志污染。I 去日志 → 10752 死。J 关超时 →
+3584 死。K 补 zephyr 全序列（bitlen/EOF/FIFO/PCR 复位）→ 0 死
+（bitlen 没写进）。L 顺序重排 → 10752 死。M dump_pos 监测 → 源活着。
+N espsoup 烧板裁判（PDIAG/PCAP/PRUN）→ 硅无罪。O bitlen readback
+验证+写入成功 → **34.3 MB/s 零重启**。P div_num 直改 5 → **40.0 MB/s**。
+
+**对 diag.rs 裸路径的回灌（C4 后续）**：diag.rs 序列与时序要求一致，
+但需验证其 bitlen readback（diagprobe 旧轮显示 0——同为时序受害者）；
+start() 里补 intr_mem 窗口写入；确认 auto_ret 未被显式清零。
+
+### 10.3 下一步（C4 剩余）
+
+- diagprobe2 手工序列固化进 mmio（替换/融合 diag.rs 裸路径），
+  上 60 秒验收 + CIC 消费任务 + IQ8 流帧。
+- lsb 自动选窗（espsoup 99.9% 幅度法+中值×2.2 抗突发）。
+- WiFi 混杂过滤器清零（run 期）+ 每 run 前 DC 校准（espsoup 教训）。
+- 60 秒验收目标：40 MB/s 零索引跳变（PRUN 已证硬件可达）。
 
 - **C5 SoftAP 在 esp-radio 1.0.0-beta.1 上不发射信标**：官方未改动的
   embassy_access_point 示例（同 tag、同工具链）在本板同样扫不到
