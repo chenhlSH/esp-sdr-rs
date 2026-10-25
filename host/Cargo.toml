@@ -1,0 +1,7 @@
+[package]
+name = "esp-sdr-host"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+esp-sdr-shared = { path = "../shared" }

@@ -1,0 +1,6 @@
+[package]
+name = "esp-sdr-mmio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

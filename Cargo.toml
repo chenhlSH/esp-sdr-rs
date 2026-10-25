@@ -1,0 +1,32 @@
+[workspace]
+resolver = "3"
+members = [
+    "firmware/esp-sdr-mmio",
+    "firmware/esp-sdr-radio",
+    "firmware/apps",
+    "host",
+    "shared",
+]
+# default-members 只含能在主机上直接构建/测试的成员；
+# 固件成员用 `cargo build -p <pkg> --target riscv32imac-unknown-none-elf` 显式构建。
+default-members = ["host", "shared"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+defmt = "1.1"
+embassy-executor = "0.10.0"
+embassy-time = "0.5.0"
+esp-backtrace = "0.20.0"
+esp-bootloader-esp-idf = "0.6.0"
+esp-hal = "1.2.2"
+esp-println = "0.18.0"
+esp-rtos = { version = "0.4.0", features = ["embassy"] }
+
+[profile.release]
+debug = true
+debug-assertions = true
+lto = "fat"
+codegen-units = 1

@@ -1,0 +1,25 @@
+[package]
+name = "esp-sdr-apps"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+defmt.workspace = true
+embassy-executor.workspace = true
+embassy-time.workspace = true
+esp-backtrace = { workspace = true, features = ["panic-handler", "defmt"] }
+esp-bootloader-esp-idf.workspace = true
+esp-hal.workspace = true
+esp-println = { workspace = true, features = ["defmt-espflash"] }
+esp-rtos.workspace = true
+
+# 目标芯片在构建期钉死为 ESP32-C5（workspace 唯一目标板）。
+[features]
+default = ["esp32c5"]
+esp32c5 = [
+    "esp-backtrace/esp32c5",
+    "esp-println/esp32c5",
+    "esp-bootloader-esp-idf/esp32c5",
+    "esp-rtos/esp32c5",
+    "esp-hal/esp32c5",
+]
