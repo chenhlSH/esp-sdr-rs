@@ -56,28 +56,20 @@ async fn diag_probe_task() {
 
     loop {
         Timer::after(Duration::from_secs(60)).await;
-        let mut stream = DiagStream::start_with_isr(0);
+        // 轮询模式（owner 归还修复后的主验证路径）
+        let mut stream = DiagStream::start(0);
         let started = esp_hal::time::Instant::now();
         let run_for = esp_hal::time::Duration::from_secs(5);
         while started.elapsed() < run_for {
-            // ISR 推进计数；这里只周期采样打印
-            Timer::after(Duration::from_millis(500)).await;
-            let bytes = stream.producer_bytes_isr();
-            let mbps_x10 = bytes / 100_000;
-            defmt::info!(
-                "producer tick: {} bytes ({}.{} MB/s), overrun={}",
-                bytes,
-                mbps_x10 / 10,
-                mbps_x10 % 10,
-                stream.overrun_isr()
-            );
+            // 紧轮询：环 1.43 ms 一圈，间隔轮询必然套圈
+            let _ = stream.poll_producer();
         }
-        let total = stream.producer_bytes_isr();
-        let overrun = stream.overrun_isr();
+        let total = stream.producer_bytes();
+        let overrun = stream.overrun();
         stream.stop();
         let mbps_x10 = total / 5 / 100_000;
         defmt::info!(
-            "FINAL: {} bytes ({}.{} MB/s), overrun={}",
+            "FINAL(poll): {} bytes ({}.{} MB/s), overrun={}",
             total,
             mbps_x10 / 10,
             mbps_x10 % 10,

@@ -43,9 +43,9 @@ const DUMP_CLK_EN_REG: u32 = 0x600a_0800;
 const DUMP_CLK_EN_BIT: u32 = 1 << 2;
 const DUMP_USAGE_REG: u32 = 0x6009_5004;
 const DUMP_USAGE_FIELD_MASK: u32 = 0xF << 8;
-/// 块 1 属主值：bits 11:8 = 2（BIT(1)<<8）+ MAC_DUMP_ALLOC bit 16。
+/// 块 1 属主值：bits 11:8 = 2（BIT(1)<<8）+ bit 16（zephyr 命名 MAC_DUMP_ALLOC；
+/// espsoup 实测语义为半区选择：1=上半区 0x40830000。同一位，置 1 为工作态）。
 const DUMP_USAGE_BANK1: u32 = 1 << 9;
-const DUMP_USAGE_ALLOC: u32 = 1 << 16;
 /// dump engine 计数字段 17 位；>65535 永不置 DONE → 自由运行（zephyr DUMP_ENDLESS）。
 const DUMP_ENDLESS: u32 = 0x1_FFFF;
 
@@ -285,7 +285,7 @@ impl DiagStream {
         let parlio = unsafe { esp32c5::PARL_IO::steal() };
         let dma = unsafe { esp32c5::DMA::steal() };
 
-        // ---- dump engine 自由运行（zephyr esp_sdr_diag_run 358-368 行）----
+        // ---- dump engine 自由运行（zephyr esp_sdr_diag_run 序列，实测最优基线）----
         let usage_saved = rd(DUMP_USAGE_REG);
         wr(DUMP_CTRL_REG, 0);
         wr(DUMP_CLK_FORCE_REG, u32::MAX);
@@ -295,21 +295,23 @@ impl DiagStream {
         wr(DUMP_CONFIG_REG, (lane & !DUMP_CONFIG_LANES_MASK) | DUMP_CONFIG_IQ);
         let mode = rd(DUMP_MODE_REG);
         wr(DUMP_MODE_REG, (mode & !DUMP_MODE_SOURCE_MASK) | DUMP_MODE_SOURCE_IQ);
+        // 让渡：bits 11:8=块 1 + bit16（zephyr 的 MAC_DUMP_ALLOC 位；
+        // espsoup 语义为半区选择=1→上半区，两种命名同一位，置 1 为实测工作态）
         wr(
             DUMP_USAGE_REG,
-            (usage_saved & !DUMP_USAGE_FIELD_MASK) | DUMP_USAGE_BANK1 | DUMP_USAGE_ALLOC,
+            (usage_saved & !DUMP_USAGE_FIELD_MASK) | DUMP_USAGE_BANK1 | 1 << 16,
         );
         riscv_fence();
         let _flush = rd(DUMP_USAGE_REG);
         // 速率字段清零 + 无尽计数触发
         let mode = rd(DUMP_MODE_REG);
         wr(DUMP_MODE_REG, mode & !DUMP_MODE_RATE_MASK);
-        let ctrl = DUMP_CTRL_RUN | (DUMP_ENDLESS & DUMP_CTRL_COUNT_MASK);
-        wr(DUMP_CTRL_REG, (DUMP_ENDLESS & DUMP_CTRL_COUNT_MASK) | DUMP_CTRL_DONE);
+        let ctrl = DUMP_CTRL_RUN | DUMP_ENDLESS;
+        wr(DUMP_CTRL_REG, DUMP_ENDLESS | DUMP_CTRL_DONE);
         wr(DUMP_CTRL_REG, ctrl);
         wr(DUMP_CTRL_REG, ctrl | DUMP_CTRL_TRIGGER);
         wr(DUMP_CTRL_REG, ctrl);
-        // 块 1 立即交还 CPU：环与描述符住在里面
+        // 块 1 立即交还 CPU：环与描述符住在下半区
         wr(DUMP_USAGE_REG, usage_saved);
         riscv_fence();
         let _flush = rd(DUMP_USAGE_REG);
@@ -488,7 +490,9 @@ impl DiagStream {
             if length == 0 {
                 break;
             }
-            unsafe { write_volatile(desc as *mut u32, dw0 & !DW0_LENGTH_MASK) };
+            // 清 length 并把 owner 归还 DMA（zephyr ISR 同款两步；不重设 owner，
+            // DMA 回绕到该描述符时停链——C4 关键发现）
+            unsafe { write_volatile(desc as *mut u32, (dw0 & !DW0_LENGTH_MASK) | DW0_OWNER_DMA) };
             self.producer_bytes += u64::from(length);
             self.head = (self.head + 1) % NODES;
             walked += 1;

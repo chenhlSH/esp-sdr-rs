@@ -155,28 +155,64 @@ prepare_rx();
   cic_inverse/normalize（2^(32+lsb)/R³ 定点倒数归一，量纲=10bit×16）。
 - **dump engine 自由运行序列**（无尽计数 0x1FFFF + 速率清零 + 触发后
   usage 立即复原）：触发后诊断总线有数据。
-- **GPIO 矩阵回环**（8 pad×（IO_MUX mcu_sel=0 + 矩阵出 MODEM_DIAG0+lane
-  + 入 PARL_RX_DATA0+k））+ **PARLIO 40 MHz 采样**（PLL_F240M÷6、8 位、
-  LSB、软分隔符 rx_bitlen=环总位长、EOF=RX_FULL）+ **GDMA AHB ch0
-  （触发 9）环形 16×3584B 描述符**：首轮实测 desc[0..2] 完成且 length
-  正确写回（0xE00=3584），证明 PARLIO→GDMA→SRAM 数据通路连通。
+- **GPIO 矩阵回环** + **PARLIO 40 MHz 采样**（PLL_F240M÷6、8 位、LSB、
+  软分隔符 rx_bitlen=环总位长、EOF=RX_FULL）+ **GDMA AHB ch0（触发 9）
+  环形 16×3584B 描述符**：实测 desc[0..2] 完成且 length 正确写回
+  （0xE00=3584），证明 PARLIO→GDMA→SRAM 数据通路连通。
 
-当前卡点（顺序排查中）：
-1. **生产持续 ~270µs（2-3 个描述符）后停**：PARLIO int_raw=RX_FIFO_WOVF
-   （bit1，FIFO 写溢出）+ GDMA int_raw=in_done|in_dscr_empty。DMA 不再
-   搬运，PARLIO 溢出。已排除：中断状态粘滞（轮询清状态无效）、通道
-   优先级/加权仲裁/inlink_auto_ret（组合实验无效）、触发号错误
-   （SOC_GDMA_TRIG_PERIPH_PARLIO0=9 已核对）。
-2. **ISR 绑定未生效**：esp_hal::interrupt bind_handler+enable(DMA_IN_CH0,
-   P1) 后 ISR 从未执行（ISR_BYTES 恒 0，尽管裸轮询同期能看到完成的
-   描述符）。怀疑与 esp-rtos 向量/优先级交互，未定位。
+当前卡点：**生产持续 2-3 个描述符（~180-270µs）后停**。已排除：
+owner 不归还（已加 zephyr 同款归还）、总线复位脉冲、通道优先级/
+加权仲裁/inlink_auto_ret、中断状态粘滞。每轮实测有随机性
+（3584/7168/10752 字节后停）。
 
-下一步候选（按优先级）：
-- 换 esp-hal 官方 GDMA 驱动路径（ParlIoRx + DmaLoopBuf/DmaRxStreamBuf）
-  替代裸寄存器——驱动内处理了未文档化时序；
-- 逐项 diff hal_espressif(54d64a1) 的 ahb_dma_ll.h 与本实现的寄存器
-  序列（尤其 reset/burst/rsp 相关）；
-- 向 ESPsoup/esp-sdr-zephyr 社区提问（C5 GDMA 环停走的已知坑）。
+### 10.1 espsoup-firmware 源码考古结论（第二个独立实现，活答案）
+
+读毕 `main/families/c5_c6_c61/parlio_cap.h` 与 `c5_engine.h`（GPL-3.0，
+只读参考）：
+
+1. **ESPsoup 的 PARLIO 走 IDF 官方驱动**（`driver/parlio_rx.h`：
+   `parlio_new_rx_unit`（dma_burst_size=32, trans_queue_depth=2,
+   max_recv_size=环长）+ `parlio_new_rx_soft_delimiter`（eof_data_len=
+   环长）+ `parlio_rx_unit_receive`（partial_rx_en=true））——**非硬件
+   环形链**；IDF 驱动内部管理 GDMA 重建链。**硬件环形链只有 zephyr 一家
+   在用（且工作）**。
+2. **owner bit16 = 半区选择**（0=下半区 0x40820000，1=上半区
+   0x40830000；espsoup 实测语义）——zephyr 命名 MAC_DUMP_ALLOC 是
+   同一位的另一理解。写位置 = 半区基址 + 4×(position mod 16384)。
+3. **DUMP_MODE bits 0-16 = 实时写位置**（可无中断跟踪生产进度）。
+4. **0x600a20b4 = source-15 门控**：bit0 置位则源被 gate；访问一次
+   停总线 0.82ms；espsoup 仅 boot 检查。**本板（rev v1.2）实测：读并
+   清零后反而完全无数据（0 字节）**——gate 语义在 rev v1.2 上可能相反
+   或该读操作有副作用，已回滚（不碰此寄存器）。vendor adctrig 每次
+   采集 RMW 它（stock 路径 1.7ms 开销来源）。
+5. **I/Q nibble 布局与 zephyr 相反**：espsoup 实测 byte =
+   I[lsb+3:lsb]（低 nibble）| Q[lsb+3:lsb]<<4（高 nibble）；MODEM_DIAG
+   [0:9]=I、[10:19]=Q（10bit 有符号）。zephyr 主张 Q 低 I 高。真值待
+   C4 通流后以已知信号裁定（box16 已按可交换设计）。
+6. **lsb 默认 6**（I[9:6]/Q[9:6] 高位窗），非 0；AUTO 用 2×16KB 快照
+   99.9% 幅度点选窗；VFM 模式用中值×2.2（抗突发）。
+7. **WiFi 混杂过滤器运行期清零**（pe_quiet_wifi，想法源自 C5VRX）：
+   驱动任务收帧会抢占消费任务足够久导致环溢出（繁忙信道）。
+8. **每 run 前 DC 校准**（dc_cal）：DC 会吃掉 4bit 窗（实测 30-43
+   ADC8 counts @5GHz/gain60）。
+9. espsoup box16 输出直接打包回 dump 32 位字格式：
+   w[j] = (4*si-480)&1023 | ((4*sq-480)&1023)<<10。
+10. dump_arm 顺序：CTRL=0 → 速率 → 时钟强制 → 计数预写（无 RUN）→
+    lanes → owner 让渡 → fence → 源 15 → go（RUN+trigger 脉冲）。
+    与 zephyr 差异：源 15 在让渡后。**实测采用 zephyr 顺序（让渡前），
+    两者均可产数据。**
+11. DMA 侧无额外魔法：GDMA 全部经 IDF gdma 驱动（申请通道、默认
+    内存范围、owner check off、RX_DONE 中断）。
+
+### 10.2 下一步（option A 已获批）
+
+换 **esp-hal 官方 PARLIO/GDMA 驱动路径**（对齐 espsoup 的 IDF 驱动
+用法，产出跨实现数据点）：
+- esp-hal `parl_io::ParlIoRx` + `DmaRxStreamBuf`（流式 RX）；
+- 时钟源：查 esp-hal PARLIO 是否支持内部 PLL 时钟（RxClkInPin 是
+  外部引脚泛型——若仅支持外部时钟，需评估时钟输出回环或保留裸路径）；
+- 数据线：`RxDataPins` 8 位（GPIO 0,1,3,4,5,7,10,23）；
+- 失败再按指示逐项 diff hal fork 的 ahb_dma_ll.h / 内联汇编对照。
 
 - **C5 SoftAP 在 esp-radio 1.0.0-beta.1 上不发射信标**：官方未改动的
   embassy_access_point 示例（同 tag、同工具链）在本板同样扫不到
