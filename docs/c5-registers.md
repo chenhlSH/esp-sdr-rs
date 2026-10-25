@@ -147,7 +147,36 @@ prepare_rx();
   tools/serial_capture.ps1（连续抓 → 文件）、tools/serial_echo_test.ps1（回显）、
   tools/probe_run.ps1（烧写+限时监控）。
 
-## 10. C3 实测结论（esp-radio 1.0.0-beta.1 AP + 桥路线）
+## 10. C4 中期实测（进行中，截至本 commit）
+
+已验证通路：
+- **DSP 全套（主机单测 13/13 绿）**：box16（nibble 半边和）→ 2.5 MS/s；
+  三阶 CIC（R=8..255，I/Q 双路 u32 回绕积分 + 输出率梳状）；
+  cic_inverse/normalize（2^(32+lsb)/R³ 定点倒数归一，量纲=10bit×16）。
+- **dump engine 自由运行序列**（无尽计数 0x1FFFF + 速率清零 + 触发后
+  usage 立即复原）：触发后诊断总线有数据。
+- **GPIO 矩阵回环**（8 pad×（IO_MUX mcu_sel=0 + 矩阵出 MODEM_DIAG0+lane
+  + 入 PARL_RX_DATA0+k））+ **PARLIO 40 MHz 采样**（PLL_F240M÷6、8 位、
+  LSB、软分隔符 rx_bitlen=环总位长、EOF=RX_FULL）+ **GDMA AHB ch0
+  （触发 9）环形 16×3584B 描述符**：首轮实测 desc[0..2] 完成且 length
+  正确写回（0xE00=3584），证明 PARLIO→GDMA→SRAM 数据通路连通。
+
+当前卡点（顺序排查中）：
+1. **生产持续 ~270µs（2-3 个描述符）后停**：PARLIO int_raw=RX_FIFO_WOVF
+   （bit1，FIFO 写溢出）+ GDMA int_raw=in_done|in_dscr_empty。DMA 不再
+   搬运，PARLIO 溢出。已排除：中断状态粘滞（轮询清状态无效）、通道
+   优先级/加权仲裁/inlink_auto_ret（组合实验无效）、触发号错误
+   （SOC_GDMA_TRIG_PERIPH_PARLIO0=9 已核对）。
+2. **ISR 绑定未生效**：esp_hal::interrupt bind_handler+enable(DMA_IN_CH0,
+   P1) 后 ISR 从未执行（ISR_BYTES 恒 0，尽管裸轮询同期能看到完成的
+   描述符）。怀疑与 esp-rtos 向量/优先级交互，未定位。
+
+下一步候选（按优先级）：
+- 换 esp-hal 官方 GDMA 驱动路径（ParlIoRx + DmaLoopBuf/DmaRxStreamBuf）
+  替代裸寄存器——驱动内处理了未文档化时序；
+- 逐项 diff hal_espressif(54d64a1) 的 ahb_dma_ll.h 与本实现的寄存器
+  序列（尤其 reset/burst/rsp 相关）；
+- 向 ESPsoup/esp-sdr-zephyr 社区提问（C5 GDMA 环停走的已知坑）。
 
 - **C5 SoftAP 在 esp-radio 1.0.0-beta.1 上不发射信标**：官方未改动的
   embassy_access_point 示例（同 tag、同工具链）在本板同样扫不到

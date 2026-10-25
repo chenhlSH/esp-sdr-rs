@@ -5,6 +5,9 @@
 
 #![no_std]
 
+/// 诊断总线流的定点信号处理（box16 + CIC + 归一化），主机可测。
+pub mod dsp;
+
 /// 频率与调谐的纯逻辑（esp-sdr common/rx_tuning.h 的 C5 规则）。
 pub mod frequency {
     /// 软件调谐限幅，与射频标称频段无关（reference/esp-sdr common/rx_tuning.h）。

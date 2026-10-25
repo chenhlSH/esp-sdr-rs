@@ -24,6 +24,7 @@ esp-rtos.workspace = true
 esp-sdr-mmio = { path = "../esp-sdr-mmio" }
 esp-sdr-radio = { path = "../esp-sdr-radio" }
 esp-sdr-shared = { path = "../../shared" }
+esp32c5 = { workspace = true }
 nb.workspace = true
 static_cell.workspace = true
 
@@ -38,4 +39,5 @@ esp32c5 = [
     "esp-hal/esp32c5",
     "esp-radio/esp32c5",
     "esp-radio/wifi",
+    "esp-sdr-mmio/esp32c5",
 ]

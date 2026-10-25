@@ -1005,6 +1005,7 @@ dependencies = [
  "esp-sdr-mmio",
  "esp-sdr-radio",
  "esp-sdr-shared",
+ "esp32c5 0.3.0",
  "nb 1.1.0",
  "static_cell",
 ]
@@ -1022,7 +1023,9 @@ name = "esp-sdr-mmio"
 version = "0.1.0"
 dependencies = [
  "defmt 1.2.0",
+ "esp-hal",
  "esp-sdr-shared",
+ "esp32c5 0.3.0",
 ]
 
 [[package]]

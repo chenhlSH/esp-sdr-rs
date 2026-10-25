@@ -115,6 +115,15 @@ enum StreamError {
     Tcp(embassy_net::tcp::Error),
 }
 
+impl StreamError {
+    fn describe(&self) -> &'static str {
+        match self {
+            StreamError::Capture(_) => "capture",
+            StreamError::Tcp(_) => "tcp",
+        }
+    }
+}
+
 /// TCP 服务任务：接受连接 → 协议头 → 消费命令 → 持续节拍流。
 #[embassy_executor::task]
 async fn tcp_server_task(stack: Stack<'static>) {
