@@ -22,6 +22,9 @@ async fn main(spawner: Spawner) {
 
     defmt::info!("esp-sdr heartbeat start");
 
+    // esp-rtos 的 esp-radio 特性引入了需要堆的线程基础设施
+    esp_alloc::heap_allocator!(size: 32 * 1024);
+
     let timer_group0 = esp_hal::timer::timg::TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timer_group0.timer0, peripherals.FROM_CPU_INTR0);
 

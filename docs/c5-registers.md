@@ -114,3 +114,5 @@ prepare_rx();
 - divider → 速率的精确映射（LIMITS 表 6 档 vs adctrig divider*2 编码）
 - `rx_recalibration.c` 的重校准触发条件与移植必要性
 - 带宽 mode 参数取值（rx_bandwidth.h）
+- AGCPWR_CTRL7 bit 23 的语义（C1 实测：手动增益 40 锁定后仍读 0；
+  上游从未标注该位，不能当作"已强制"指示）

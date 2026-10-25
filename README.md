@@ -11,7 +11,7 @@ docs/c5-registers.md），代码独立实现。
 | 检查点 | 内容 | 状态 |
 |---|---|---|
 | C0 | workspace 骨架、钉死工具链、heartbeat、参考与 vendor 落地 | **完成**（上板验证通过） |
-| C1 | 射频点亮（PHY 启动、调谐、增益锁） | 未开始 |
+| C1 | 射频点亮（PHY 启动、调谐、增益锁） | **完成**（上板验证通过） |
 | C2 | 突发采集 PoC + 主机频谱工具 | 未开始 |
 | C3 | rtl_tcp 节拍流 | 未开始 |
 | C4 | 无缝流（诊断总线→PARLIO→GDMA→定点抽取） | 未开始 |
@@ -53,8 +53,15 @@ tools\espflash\espflash.exe monitor -S -p COM4 --elf target\riscv32imac-unknown-
 - `flash --monitor` 组合命令在监控接入阶段可能报 `os error 22`，分开执行
   `flash` 与 `monitor` 可稳定工作。
 - rustup 官方 CDN 若过慢，可用镜像加速安装工具链：
-  `set RUSTUP_DIST_SERVER=https://mirror.sjtu.edu.cn/rust-static`（仅用户侧环境变量，
-  本仓库构建不依赖任何镜像）。
+  `set RUSTUP_DIST_SERVER=https://mirror.sjtu.edu.cn/rust-static`（仅用户侧环境变量）。
+- crates.io 下载若被重置，在 CARGO_HOME（如 `D:\Rust\.cargo\config.toml`）加镜像：
+  `[source.crates-io]` + `replace-with = 'rsproxy-sparse'` + `[source.rsproxy-sparse]`
+  + `registry = "sparse+https://rsproxy.cn/index/"`（仅用户侧配置，仓库本身不依赖镜像）。
+
+## 依赖版本组合（钉死）
+
+esp-hal 1.2.2 + esp-rtos 0.4.0 + esp-radio **1.0.0-beta.1**（三者 2026-09 同期配套发布；
+esp-radio 0.18.0 需要 esp-hal ~1.1，与 esp-rtos 0.4 互斥，不可混用）。
 
 ## 目录结构
 

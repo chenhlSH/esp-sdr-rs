@@ -2,5 +2,8 @@
 name = "esp-sdr-radio"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [dependencies]
+defmt.workspace = true
+esp-sdr-shared = { path = "../../shared" }
