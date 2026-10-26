@@ -286,6 +286,18 @@ impl Radio {
         self.prepare_receive();
     }
 
+    /// duplex 模式：TX 链保持开启的同时重新打开接收部件
+    /// （zephyr rfprobe "tx carrier" 的 rx bits 1/2/4：workmode → RX 电源
+    /// → RX 时钟，顺序照抄）。用于自环验证：RX 可采集自身 TX 的泄漏，
+    /// 判断空口路径是否工作。
+    pub fn rx_chain_duplex_on(&mut self) {
+        unsafe {
+            phy_pbus_workmode();
+            phy_pbus_xpd_rx_on(1);
+            phy_set_rxclk_en(1);
+        }
+    }
+
     /// 基带 DC 硬件校准（移植自 espsoup dc_cal.h / ESPARGOS
     /// receiver_dc_calibrate；算法为公开的 Newton 2x2 步进）。
     ///

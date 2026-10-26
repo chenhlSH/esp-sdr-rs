@@ -220,3 +220,59 @@ pub fn cycle_count() -> u32 {
     unsafe { core::arch::asm!("rdcycle {}", out(reg) value, options(nostack)) };
     value
 }
+
+/// 一次原始 dump 采集（手写序列，zephyr esp_sdr_rx.c capture_locked 同款）：
+/// 让渡块 1 给引擎 → 有限计数触发 → 等 DONE → 属主复原 → 返回块 1 的
+/// `word_count` 字切片。采样率 = 引擎当前档（默认 80 MS/s；本函数不动
+/// 速率字段）。
+///
+/// 与 [Replay] 互斥：两者都占用 dump engine 的块 1 属主（调用方保证
+/// 不同时进行——本函数自带完整的让渡/复原，结束即归还）。
+pub fn capture_raw(word_count: usize) -> Result<&'static [u32], ReplayError> {
+    if word_count == 0 || word_count > 65_535 {
+        return Err(ReplayError::BadCount {
+            requested: word_count,
+        });
+    }
+    const DUMP_CTRL_RUN: u32 = 1 << 31;
+    const DUMP_CTRL_TRIGGER: u32 = 1 << 19;
+    const DUMP_CTRL_DONE: u32 = 1 << 18;
+
+    let usage_saved = rd(DUMP_USAGE_REG);
+    wr(DUMP_CTRL_REG, 0);
+    wr(DUMP_CLK_FORCE_REG, u32::MAX);
+    let clk_en = rd(DUMP_CLK_EN_REG);
+    wr(DUMP_CLK_EN_REG, clk_en | DUMP_CLK_EN_BIT);
+    let lane = rd(DUMP_CONFIG_REG);
+    wr(DUMP_CONFIG_REG, (lane & !DUMP_CONFIG_LANES_MASK) | DUMP_CONFIG_IQ);
+    let mode = rd(DUMP_MODE_REG);
+    wr(DUMP_MODE_REG, (mode & !DUMP_MODE_SOURCE_MASK) | DUMP_MODE_SOURCE_IQ);
+    wr(
+        DUMP_USAGE_REG,
+        (usage_saved & !DUMP_USAGE_FIELD_MASK) | DUMP_USAGE_BANK1 | 1 << 16,
+    );
+    fence();
+    let _flush = rd(DUMP_USAGE_REG);
+
+    let count = word_count as u32;
+    wr(DUMP_CTRL_REG, count | DUMP_CTRL_DONE);
+    wr(DUMP_CTRL_REG, count | DUMP_CTRL_RUN);
+    wr(DUMP_CTRL_REG, count | DUMP_CTRL_RUN | DUMP_CTRL_TRIGGER);
+    wr(DUMP_CTRL_REG, count | DUMP_CTRL_RUN);
+    // 有限计数（≤65535）完成时置 DONE；20 ms 超时（240 MHz）
+    let started = cycle_count();
+    while rd(DUMP_CTRL_REG) & DUMP_CTRL_DONE == 0 {
+        if cycle_count().wrapping_sub(started) > 4_800_000 {
+            break;
+        }
+    }
+    // 收尾：CTRL=0 + 属主归还 CPU（espsoup：引擎拥有时 CPU 读到 stale 值）
+    wr(DUMP_CTRL_REG, 0);
+    wr(DUMP_USAGE_REG, usage_saved);
+    fence();
+    let _flush = rd(DUMP_USAGE_REG);
+
+    Ok(unsafe {
+        core::slice::from_raw_parts(BANK_START_ADDRESS as *const u32, word_count)
+    })
+}

@@ -1,14 +1,15 @@
-//! C5 长时发射信标：QPSK 400 kS/s 符号流，5 分钟，1 秒通断交替。
+//! C5 长时发射信标 v2：最大功率、连续 QPSK、三频点轮换。
 //!
-//! 用途：外部接收机（SDR/从机）验证发射链路。参数：
-//! - 中心频率 2412 MHz（ISM 信道 1），功率步 0（厂商最大回退）；
-//! - 调制：QPSK 随机符号（xorshift32），多相 Blackman-sinc 成形，
-//!   DAC 样本率 400 kS/s（占用带宽 ≈ ±200 kHz）；
-//! - 时序：1 秒发射 / 1 秒静默交替，共 300 秒；
-//! - 结束后自动停链、恢复 RX 并打印总结。
+//! 相对 v1 的修正（v1 收不到的根因）：
+//! - 功率步 0 → **15**：vendor 每步 2 dB 回退，v1 实际衰减 30 dB（比
+//!   WiFi 额定功率弱 1000 倍）；
+//! - 1 秒通断 → **连续发射**（密度 100%）；
+//! - 单频点 2412 → **30 秒轮换 2484 / 5180 / 5745 MHz**（2.4G ISM 上沿
+//!   与两个 5G 非 DFS 信道），共 5 分钟。
 //!
-//! **发射期间零 defmt 输出**：无人读串口时 esp-println 会阻塞并卡死
-//! 固件（C2 教训）——总结放在发射结束后打印（此时卡死也无害）。
+//! 参数：QPSK 100 kS/s × interp 4 = 400 kS/s DAC（带宽 ≈ ±200 kHz），
+//! 多相 Blackman-sinc 成形。发射期间零 defmt 输出（无人读串口时阻塞
+//! 会卡死固件）；总结在结束后打印。
 
 #![no_std]
 #![no_main]
@@ -25,19 +26,17 @@ use esp_sdr_radio::Radio;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
-const FREQUENCY_MHZ: u32 = 2412;
-const GAIN_CODE: u32 = 40;
-/// 厂商功率步 0 = 最大回退（15 步 × 8 单位）。
-const TX_POWER: u32 = 0;
-/// 符号速率 100 kS/s × interp 4 = 400 kS/s DAC（实测每样本 ~329 cycles，
-/// 上限 ~730 kS/s；400 kS/s 时 CPU 占用约 55%）。
+/// 频点轮换表（ISMS 合法频段：2484 = 2.4G ISM 上沿；
+/// 5180 = 5G ch36、5745 = 5G ch149，均非 DFS）。
+const HOP_MHZ: [u32; 3] = [2484, 5180, 5745];
+/// 每频段 30 秒 × 10 段 = 5 分钟。
+const SEGMENT_WINDOWS: u32 = 10;
+const WINDOW_SECONDS: u32 = 30;
+const WINDOW_CYCLES: u32 = 240_000_000;
+/// 最大功率步（无回退，vendor WiFi 额定功率）。
+const TX_POWER: u32 = 15;
 const SYMBOL_RATE_HZ: u32 = 100_000;
 const INTERP: u32 = 4;
-/// 1 秒窗口 @240 MHz。
-const WINDOW_CYCLES: u32 = 240_000_000;
-/// 300 个窗口 = 5 分钟。
-const WINDOWS: u32 = 300;
-/// QPSK 幅度（16 位量纲；Shaper 内 >>6 → DAC ±~500）。
 const SYMBOL_AMPLITUDE: i16 = 6000;
 
 struct QpskSource {
@@ -63,47 +62,42 @@ impl QpskSource {
 
 #[embassy_executor::task]
 async fn beacon_task(mut radio: Radio) {
-    // 发射：5 分钟，1 秒通断
-    radio.tx_chain_on(TX_POWER).unwrap();
-    let mut paced = TxPaced::start(SYMBOL_RATE_HZ, INTERP).unwrap();
     let mut source = QpskSource::new();
+    let mut total_samples: u64 = 0;
+    let mut total_late: u32 = 0;
+    let mut late_max: u32 = 0;
 
-    for window in 0..WINDOWS {
-        let transmitting = window % 2 == 0;
-        let window_start = cycle_count();
-        if transmitting {
-            while cycle_count().wrapping_sub(window_start) < WINDOW_CYCLES {
-                paced.poll(|| source.next());
-            }
-        } else {
-            // 静默窗口：DAC 样本推 0（无载波）
-            while cycle_count().wrapping_sub(window_start) < WINDOW_CYCLES {
-                paced.poll(|| (0, 0));
-            }
+    for segment in 0..SEGMENT_WINDOWS {
+        let mhz = HOP_MHZ[segment as usize % HOP_MHZ.len()];
+        // 换频 + 重开 TX 链（tone 路径按当前频点调谐）
+        radio.set_frequency(mhz).unwrap();
+        radio.tx_chain_on(TX_POWER).unwrap();
+        let mut paced = TxPaced::start(SYMBOL_RATE_HZ, INTERP).unwrap();
+        let segment_start = cycle_count();
+        let segment_cycles = WINDOW_CYCLES * WINDOW_SECONDS;
+        while cycle_count().wrapping_sub(segment_start) < segment_cycles {
+            paced.poll(|| source.next());
         }
+        let stats = paced.stats();
+        total_samples += stats.samples;
+        total_late += stats.late;
+        late_max = late_max.max(stats.late_max);
+        paced.stop();
+        radio.tx_chain_off();
     }
-    let samples = paced.stats().samples;
-    let late = paced.stats().late;
-    let late_max = paced.stats().late_max;
-    paced.stop();
 
-    // 结束：停链 + 恢复 RX
-    radio.tx_chain_off();
+    // 结束：RX 恢复确认 + 总结（发射已结束，打印阻塞无害）
     let mut dump_engine = DumpEngine::new();
-    let rx_note = match dump_engine.capture_burst(4096, CaptureRate::Msps20) {
-        Ok((words, _)) => {
-            let nonzero = words.iter().filter(|word| **word != 0).count();
-            nonzero
-        }
+    let rx_nonzero = match dump_engine.capture_burst(4096, CaptureRate::Msps20) {
+        Ok((words, _)) => words.iter().filter(|word| **word != 0).count(),
         Err(_) => 0,
     };
-    // 总结（发射已结束；若无人读串口，此打印的阻塞无害）
     defmt::info!(
-        "beacon done: 300 s, samples={} late={} late_max={} cycles, RX nonzero={}/4096 restored",
-        samples,
-        late,
+        "beacon v2 done: 300 s, samples={} late={} late_max={} cycles, RX nonzero={}/4096",
+        total_samples,
+        total_late,
         late_max,
-        rx_note
+        rx_nonzero
     );
 
     loop {
@@ -135,11 +129,10 @@ async fn main(spawner: Spawner) {
     drop(controller);
 
     let mut radio = Radio::new();
-    radio.set_frequency(FREQUENCY_MHZ).unwrap();
-    radio.set_gain_manual(GAIN_CODE).unwrap();
+    radio.set_frequency(HOP_MHZ[0]).unwrap();
+    radio.set_gain_manual(40).unwrap();
 
-    // 无启动打印（发射开始前进入零输出模式）
-
+    // 无启动打印（进入零输出发射模式）
     spawner.spawn(beacon_task(radio).unwrap());
 
     loop {
