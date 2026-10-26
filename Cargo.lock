@@ -1005,6 +1005,7 @@ dependencies = [
  "esp-sdr-mmio",
  "esp-sdr-radio",
  "esp-sdr-shared",
+ "esp-wifi-sys-esp32c5",
  "esp32c5 0.3.0",
  "nb 1.1.0",
  "static_cell",

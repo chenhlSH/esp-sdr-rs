@@ -24,6 +24,8 @@ esp-rtos.workspace = true
 esp-sdr-mmio = { path = "../esp-sdr-mmio" }
 esp-sdr-radio = { path = "../esp-sdr-radio" }
 esp-sdr-shared = { path = "../../shared" }
+# raw 802.11 帧发射（txwifi）；与 esp-radio 内部同一 0.3.0 crate，符号共享
+esp-wifi-sys-esp32c5.workspace = true
 esp32c5 = { workspace = true }
 nb.workspace = true
 static_cell.workspace = true

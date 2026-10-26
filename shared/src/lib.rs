@@ -8,6 +8,87 @@
 /// 诊断总线流的定点信号处理（box16 + CIC + 归一化），主机可测。
 pub mod dsp;
 
+/// 802.11 Beacon 帧构造（raw TX 用；vendor WiFi 协议栈负责 PHY 编码与
+/// FCS，本模块只拼 MAC 层字节，主机可测）。
+///
+/// 布局按 IEEE 802.11-2016 §9.3.3.3（管理帧 Beacon，24 字节头 + 12 字节
+/// 固定字段 + IEs）。未加密、ESS、支持 1-18 Mbps 基础速率。
+pub mod wifi_beacon {
+    /// 802.11 管理帧 Beacon 的 Frame Control 首字节（0x0080 LE）。
+    const FRAME_CONTROL_BEACON: [u8; 2] = [0x80, 0x00];
+    /// 广播 DA。
+    const BROADCAST: [u8; 6] = [0xFF; 6];
+    /// Capability Information：ESS(bit0) + Short Preamble(bit5) + Short
+    /// Slot Time(bit10) = 0x0421。
+    const CAPABILITY: u16 = 0x0421;
+    /// Beacon 间隔（TU，102.4 µs）：100 TU ≈ 102.4 ms。
+    pub const BEACON_INTERVAL_TU: u16 = 100;
+
+    /// 目标帧最大字节数（raw TX 上限 1500，远超实际 ~80 字节）。
+    pub const MAX_FRAME_BYTES: usize = 128;
+
+    /// 构造一个 Beacon 帧写入 `buffer`，返回帧长度。
+    ///
+    /// `mac` 为 SA/BSSID（6 字节，建议本地管理位 0x02），`ssid` ≤ 32 字节，
+    /// `channel` 为 DS Parameter 信道号。
+    pub fn build(
+        buffer: &mut [u8; MAX_FRAME_BYTES],
+        mac: [u8; 6],
+        ssid: &[u8],
+        channel: u8,
+    ) -> usize {
+        assert!(!ssid.is_empty() && ssid.len() <= 32, "ssid 1..=32 bytes");
+        let mut cursor = 0usize;
+        let mut push = |bytes: &[u8], cursor: &mut usize| {
+            buffer[*cursor..*cursor + bytes.len()].copy_from_slice(bytes);
+            *cursor += bytes.len();
+        };
+        // 帧头 24 字节
+        push(&FRAME_CONTROL_BEACON, &mut cursor);
+        push(&[0x00, 0x00], &mut cursor); // Duration
+        push(&BROADCAST, &mut cursor); // DA
+        push(&mac, &mut cursor); // SA
+        push(&mac, &mut cursor); // BSSID
+        push(&[0x00, 0x00], &mut cursor); // Sequence Control（驱动覆盖）
+        // 固定字段 12 字节
+        push(&[0u8; 8], &mut cursor); // Timestamp
+        push(&BEACON_INTERVAL_TU.to_le_bytes(), &mut cursor); // Beacon Interval
+        push(&CAPABILITY.to_le_bytes(), &mut cursor); // Capability
+        // IEs
+        push(&[0x00, ssid.len() as u8], &mut cursor); // SSID
+        push(ssid, &mut cursor);
+        // Supported Rates（1, 2, 5.5, 11, 6, 9, 12, 18 Mbps；0x80=basic）
+        push(&[0x01, 0x08, 0x82, 0x84, 0x8B, 0x96, 0x0C, 0x12, 0x18, 0x24], &mut cursor);
+        // DS Parameter Set
+        push(&[0x03, 0x01, channel], &mut cursor);
+        cursor
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::build;
+
+        #[test]
+        fn beacon_layout() {
+            let mut buffer = [0u8; super::MAX_FRAME_BYTES];
+            let mac = [0x02, 0x45, 0x53, 0x50, 0x44, 0x52];
+            let ssid = b"ESP-SDR-TX";
+            let length = build(&mut buffer, mac, ssid, 1);
+            // 24 头 + 12 固定 + (2+10) SSID + 10 rates + 3 DS
+            assert_eq!(length, 24 + 12 + 12 + 10 + 3);
+            assert_eq!(&buffer[0..2], &[0x80, 0x00]);
+            assert_eq!(&buffer[4..10], &[0xFF; 6]);
+            assert_eq!(&buffer[10..16], &mac);
+            assert_eq!(&buffer[16..22], &mac);
+            assert_eq!(buffer[24 + 12], 0x00); // SSID IE id
+            assert_eq!(buffer[24 + 12 + 1], 10); // SSID IE len
+            assert_eq!(&buffer[24 + 12 + 2..24 + 12 + 12], ssid);
+            // DS Parameter 最后 3 字节
+            assert_eq!(&buffer[length - 3..length], &[0x03, 0x01, 0x01]);
+        }
+    }
+}
+
 /// TX 多相脉冲成形（Blackman-sinc 低通，zephyr esp_sdr_paced.c
 /// fir_design 同款；表由 tools/gen_tx_fir.ps1 预生成）。
 ///

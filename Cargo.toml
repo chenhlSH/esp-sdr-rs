@@ -36,6 +36,9 @@ esp-println = "0.18.0"
 # esp-radio 1.0.0-beta.1 与 esp-hal 1.2.2 / esp-rtos 0.4.0 为同期配套发布；
 # 0.18.0 需要 esp-hal ~1.1，与 esp-rtos 0.4 互斥，故不用。
 esp-radio = { version = "=1.0.0-beta.1", features = ["esp-alloc", "unstable", "sniffer"] }
+# raw 802.11 帧发射（esp_wifi_80211_tx）；必须与 esp-radio 内部依赖
+# 同一版本（0.3.0），否则符号/类型分裂
+esp-wifi-sys-esp32c5 = "0.3.0"
 esp-rtos = { version = "0.4.0", features = ["embassy", "esp-radio"] }
 nb = "1.1"
 static_cell = "2.1.0"
