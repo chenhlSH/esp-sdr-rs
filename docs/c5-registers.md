@@ -471,3 +471,49 @@ DAC；100 ms 发射 40,003 样本（精确），统计如上。合法频段 2412
 - 首次成功采集（含 adctrig 让渡）：**543 k cycles = 2.26 ms**（attempts=1）；
 - **总 TX→RX 可用约 4.9 ms**。RX 恢复后 4096 字全部非零。
 
+## 13. C5c raw 802.11 Beacon TX（2026-10-26 成功，PC 扫描到 SSID）
+
+**目标**：不经过裸 DAC 数据路径，直接让 vendor WiFi 协议栈发射标准 802.11
+帧，使普通 WiFi 设备（本机 PC）能扫描到。结论：**成功**。
+
+**实现**（`firmware/apps/src/bin/txwifi.rs` + `shared::wifi_beacon`）：
+- 帧：61 字节标准 Beacon。24 B 管理帧头（type/subtype 0x0080、广播 DA、
+  BSSID=源 MAC `02:45:53:50:44:52`、序号）+ 12 B 固定字段（timestamp、
+  beacon interval 100 TU、capability `0x0421`）+ SSID IE + supported rates
+  （`82 84 8B 96 0C 12 18 24`）+ DS 参数（信道 1）。纯逻辑在 `shared`，
+  主机端有布局单测。
+- 发射：STA 模式、不连接任何 AP；每 100 ms 调
+  `esp_wifi_80211_tx(WIFI_IF_STA, frame, 61, true)`（≤1500 B，STA 未连接
+  是允许状态）。PHY 编码（前导/OFDM/DSSS/速率）全部由 vendor 栈完成。
+- 频点/功率：信道 1（2412 MHz ISM）、默认功率表；持续 10 分钟。
+- 发射期间零 defmt 输出（无人读串口时 defmt 会阻塞固件）。
+
+**三个根因**（前两次尝试分别返回 `0x3001` WIFI_NOT_INIT / `0x3004` WIFI_IF）：
+1. **`set_config` 只在 mode 变化时调 `esp_wifi_start`**。WifiController 初始
+   默认已是 STA，再设 STA 模式不会触发 start → 必须显式调用
+   `esp_wifi_start()`（返回 0）。
+2. **drop(controller) 会 deinit WiFi**。controller 不能只做初始化就丢弃；
+   必须传入常驻任务、在发射期间保持存活（`let _controller = controller;`）。
+3. **AP 模式 raw TX 返回 0 但外部不可见**（C5 SoftAP 信标缺陷，见 §10.5）。
+   STA 未连接模式是 raw TX 的正解。
+
+**PC 实测**（`netsh wlan show networks`）：
+```
+SSID 14 : ESP-SDR-TX
+BSSID   : 02:45:53:50:44:52
+信号    : 94%
+协议    : 802.11g
+频段    : 2.4 GHz，信道 1
+身份验证: 开放式
+```
+
+**与裸 DAC 数据路径的对照（未解）**：
+- vendor PHY 路径（CW / raw 802.11）可被外部接收机/PC 网卡收到；
+- 裸 DAC 数据路径（replay 回放、paced TXDC 注入）在同等功率/频点下**外部
+  始终收不到**（beacon v2：功率步 15、连续、2484/5180/5745 三频轮换 5 min）。
+  TXDC 注入值读回为 0（硬件消费后清），不能作为注入生效的旁证。
+- 怀疑 DAC 数据路径尚未完全配置（时钟/数据选通/块 1 让渡之外的使能位），
+  未定论；`loopprobe` 的 duplex 自环也因 vendor dump 采集冻结而无法判定
+  （同一上下文 checksum 三次相同，20/80 MS/s 均如此；C2 时代同一 helper
+  有活数据）。两项均保留为后续硬件级调查入口。
+

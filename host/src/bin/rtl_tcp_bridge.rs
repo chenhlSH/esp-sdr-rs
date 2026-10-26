@@ -2,7 +2,7 @@
 //!
 //! 板卡跑 capburst（USB-Serial/JTAG 流），本程序在 PC 上把该流
 //! 以 rtl_tcp 协议（RTL0 头 + 8 bit IQ）暴露给 SDR++/GNU Radio：
-//!   esp-sdr-host --bridge <COM 口> [监听端口，默认 1234]
+//!   rtl_tcp_bridge <COM 口> [监听端口，默认 1234]
 //!
 //! C3 教训记录：esp-radio 1.0.0-beta.1 的 C5 SoftAP 信标不发射
 //! （官方未改动示例复现，见 docs/c5-registers.md §10），WiFi 直连
@@ -150,6 +150,6 @@ fn find_magic(buffer: &[u8]) -> Option<usize> {
 }
 
 fn usage_and_exit(message: &str) -> ! {
-    eprintln!("{message}\n用法: esp-sdr-host --bridge <COM 口> [监听端口，默认 1234]");
+    eprintln!("{message}\n用法: rtl_tcp_bridge <COM 口> [监听端口，默认 1234]");
     std::process::exit(2);
 }
