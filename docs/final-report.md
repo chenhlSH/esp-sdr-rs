@@ -93,11 +93,11 @@ tools\espflash\espflash.exe flash -S -p COM4 target\riscv32imac-unknown-none-elf
 netsh wlan show networks mode=bssid | findstr /i "ESP-SDR"
 ```
 
-- 平台级注意事项（USB-SJ 死锁、drain 上限、defmt 阻塞）：README「Windows
-  USB-Serial/JTAG 实测注意事项」。
+- 平台级注意事项（USB-SJ 死锁、drain 上限、defmt 阻塞）：development-log.md
+  「Windows USB-Serial/JTAG 实测注意事项」。
 - 寄存器与逐检查点实测：`docs/c5-registers.md` §1–§13。
 - 上游问题台账：`docs/upstream-issues.md`。
-- 固件/主机/脚本清单：README 对应表格。
+- 固件/主机/脚本清单：development-log.md 对应表格。
 
 ## 6. 资产与出处
 

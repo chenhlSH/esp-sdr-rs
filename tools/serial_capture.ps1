@@ -1,10 +1,11 @@
 # Continuous serial capture to a file (no buffer overflow: read from open).
-# Usage: powershell -File tools\serial_capture.ps1 <seconds> <outfile>
+# Usage: powershell -File tools\serial_capture.ps1 <seconds> <outfile> [com=COM4]
 $ErrorActionPreference = "Stop"
 $seconds = [int]$args[0]
 $outfile = $args[1]
+$com = if ($args.Count -ge 3) { $args[2] } else { "COM4" }
 
-$port = New-Object System.IO.Ports.SerialPort COM4, 115200
+$port = New-Object System.IO.Ports.SerialPort $com, 115200
 $port.ReadTimeout = 200
 $port.ReadBufferSize = 1048576
 $port.WriteBufferSize = 1048576
