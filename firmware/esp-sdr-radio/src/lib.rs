@@ -72,6 +72,15 @@ unsafe extern "C" {
     fn phy_set_rx_gain_table(mhz: u32, arg: u32);
     /// PHY 参数表（libphy.a 全局，尺寸未知，按指针访问）。
     static mut phy_param: u8;
+    // PBUS 调试模式（DC 校准用；libphy.a，nm 已验证；声明照
+    // espsoup dc_cal.h——其固件在 C5 真机验证过该校准有效）。
+    /// 进入 PBUS debug 模式（DC DAC 可由软件强制；退出用 phy_pbus_workmode）。
+    fn phy_pbus_debugmode();
+    /// 强制 PBUS 表项：block 0..=3、bank 1..=2、value 0..=511
+    /// （block 2/3 的 bank 2 是 I/Q 基带 DC DAC 码）。
+    fn phy_pbus_force_test(block: u32, bank: u32, value: u32);
+    /// 读 PBUS 表项（debug/工作模式下均为当前生效值）。
+    fn phy_pbus_rd(block: u32, bank: u32) -> u32;
 }
 
 /// C5 逐频点接收重校准（reference/esp-sdr common/rx_recalibration.c C5 分支）。
@@ -237,5 +246,265 @@ impl Radio {
         unsafe {
             force_rx_gain(manual as u32, self.gain_code, 0);
         }
+    }
+
+    /// 基带 DC 硬件校准（移植自 espsoup dc_cal.h / ESPARGOS
+    /// receiver_dc_calibrate；算法为公开的 Newton 2x2 步进）。
+    ///
+    /// 原理：接收链基带 DC 吃掉 4 位 diag 窗口（实测 30-43 ADC8 计数），
+    /// 用 PBUS debug 模式强制 I/Q DC DAC 码（block 2/3、bank 2）把 DC
+    /// 压到 <0.5 ADC8。测量由调用方提供（20 MS/s dump 快照均值 /4）。
+    ///
+    /// 约束：
+    /// - 仅手动增益（AGC 需要工作模式，debug 模式下 PBUS 不再跟随 AGC）；
+    /// - 校准后 PBUS 停留在 debug 模式，**下一次调谐（prepare_receive）
+    ///   会切回工作模式并作废修正**——换频后必须重校准（espsoup 同款
+    ///   语义，其 DCAUTO 在每次运行前重做）；
+    /// - measure 返回 false（快照失败）时中止并还原初始 DAC 码。
+    ///
+    /// f32 仅用于本一次性路径的 2x2 解算与 Newton 步进（C5 无 FPU，
+    /// 软浮点足够：总运算量 ~百次级，不在数据面）。
+    pub fn calibrate_dc<F>(&mut self, mut measure: F) -> Result<DcCalReport, DcCalError>
+    where
+        F: FnMut(&mut [f32; 2]) -> bool,
+    {
+        if self.gain_mode != GainMode::Manual {
+            return Err(DcCalError::HardwareGain);
+        }
+        let mut report = DcCalReport::default();
+        let mut before = [0.0f32; 2];
+        if !measure(&mut before) {
+            return Err(DcCalError::MeasurementFailed);
+        }
+        report.before_centi = [to_centi(before[0]), to_centi(before[1])];
+        report.after_centi = report.before_centi;
+
+        // DC 已足够小（幅度平方 < 0.25，即 |DC| < 0.5 ADC8）→ 不动硬件
+        if dc_cost(before) < 0.25 {
+            report.skipped = true;
+            return Ok(report);
+        }
+
+        // 读全部 PBUS live 值并保留（debug 模式接管后原样回填，
+        // 保持当前 RF/基带状态）
+        let mut live = [[0u32; 2]; 4];
+        for block in 0..4u32 {
+            for bank in 1..=2u32 {
+                live[block as usize][bank as usize - 1] =
+                    unsafe { phy_pbus_rd(block, bank) };
+            }
+        }
+        let base = [live[2][1] as i32, live[3][1] as i32];
+        report.base = base;
+
+        unsafe {
+            phy_pbus_debugmode();
+        }
+        for block in 0..4u32 {
+            for bank in 1..=2u32 {
+                unsafe {
+                    phy_pbus_force_test(block, bank, live[block as usize][bank as usize - 1]);
+                }
+            }
+        }
+
+        let mut best = base;
+        let mut best_cost = dc_cost(before);
+        let mut after = before;
+
+        // 极性探测：强制 +64 码，看 DC 各轴响应符号与幅度（决定下降方向）。
+        // 不用 espsoup 的 ±16 小步 Jacobian：本板实测灵敏度低于其阈值
+        // （det<0.002 被拒、steps=0），大步长探测更鲁棒。
+        // 注意 phy_pbus_rd 读 RAM 影子表，无法验证 force 写入——唯一有效
+        // 的验证就是测量 DC 变化本身。
+        dc_apply(clamp_i32(base[0] + 64, 0, 511), base[1]);
+        let mut probe_i = [0.0f32; 2];
+        let probe_i_ok = measure(&mut probe_i);
+        dc_apply(base[0], clamp_i32(base[1] + 64, 0, 511));
+        let mut probe_q = [0.0f32; 2];
+        let probe_q_ok = measure(&mut probe_q);
+        dc_apply(base[0], base[1]);
+        if !probe_i_ok || !probe_q_ok {
+            return Err(DcCalError::MeasurementFailed);
+        }
+        report.response_centi = [
+            to_centi(probe_i[0] - before[0]),
+            to_centi(probe_i[1] - before[1]),
+            to_centi(probe_q[0] - before[0]),
+            to_centi(probe_q[1] - before[1]),
+        ];
+        // I 轴极性：+64 码使 DC_I 增大则为正向（DAC 码与 DC 同向）
+        let axis_i_sign: i32 = if probe_i[0] > before[0] { 1 } else { -1 };
+        let axis_q_sign: i32 = if probe_q[1] > before[1] { 1 } else { -1 };
+        // 灵敏度门槛：每码响应至少 0.002 ADC8（否则 DAC 无实际作用，放弃）
+        let sensitivity_i = abs_f32(probe_i[0] - before[0]) / 64.0;
+        let sensitivity_q = abs_f32(probe_q[1] - before[1]) / 64.0;
+        report.responsive = sensitivity_i >= 0.002 || sensitivity_q >= 0.002;
+        if !report.responsive {
+            report.best = base;
+            report.after_centi = report.before_centi;
+            return Ok(report);
+        }
+
+        // 坐标下降：步长从 64 逐档减半到 1；每档每轴试 ±step，取实测
+        // 更优者；|DC| < 0.5 提前收敛。
+        let mut step = 64i32;
+        while step >= 1 {
+            if best_cost <= 0.25 {
+                break;
+            }
+            for axis in 0..2usize {
+                if dc_cost(after) <= 0.25 {
+                    break;
+                }
+                let direction = if axis == 0 { axis_i_sign } else { axis_q_sign };
+                let mut axis_best = best[axis];
+                let mut axis_best_cost = dc_cost(after);
+                let mut axis_best_dc = after;
+                for attempt in [1i32, -1] {
+                    let candidate = best[axis] + direction * attempt * step;
+                    let candidate = candidate.clamp(base[axis] - 192, base[axis] + 192);
+                    let candidate = clamp_i32(candidate, 0, 511);
+                    if candidate == best[axis] {
+                        continue;
+                    }
+                    let mut trial = best;
+                    trial[axis] = candidate;
+                    dc_apply(trial[0], trial[1]);
+                    report.steps += 1;
+                    let mut observed = [0.0f32; 2];
+                    if !measure(&mut observed) {
+                        continue;
+                    }
+                    let cost = dc_cost(observed);
+                    if cost < axis_best_cost {
+                        axis_best_cost = cost;
+                        axis_best = candidate;
+                        axis_best_dc = observed;
+                    }
+                }
+                best[axis] = axis_best;
+                after = axis_best_dc;
+                dc_apply(best[0], best[1]);
+            }
+            best_cost = dc_cost(after);
+            step /= 2;
+        }
+        // 锁存实测最优码（最后一轮 apply 已是 best）
+        report.best = best;
+        report.after_centi = [to_centi(after[0]), to_centi(after[1])];
+        Ok(report)
+    }
+}
+
+/// DC 校准失败模型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
+pub enum DcCalError {
+    /// 硬件 AGC 模式下不可校准（debug 模式会让 PBUS 脱离 AGC）。
+    HardwareGain,
+    /// 测量回调返回失败（快照超时/过跑）。
+    MeasurementFailed,
+}
+
+/// DC 校准报告（定点字段，defmt 直打；×100/×1000 缩放）。
+#[derive(Debug, Clone, Copy, defmt::Format)]
+pub struct DcCalReport {
+    /// 校准前 DC（ADC8 counts × 100）。
+    pub before_centi: [i32; 2],
+    /// 校准后 DC（ADC8 counts × 100）。
+    pub after_centi: [i32; 2],
+    /// 初始 DAC 码（I, Q）。
+    pub base: [i32; 2],
+    /// 锁存的最优 DAC 码（I, Q）。
+    pub best: [i32; 2],
+    /// 实际测量步数。
+    pub steps: u32,
+    /// +64 码探测响应（DC 变化 ADC8 counts × 100）：
+    /// [I 轴→DC_I, I 轴→DC_Q, Q 轴→DC_I, Q 轴→DC_Q]。
+    pub response_centi: [i32; 4],
+    /// DAC 是否有实际作用（灵敏度 ≥ 0.002 ADC8/码）。
+    pub responsive: bool,
+    /// DC 已足够小或响应异常，未做步进。
+    pub skipped: bool,
+}
+
+impl Default for DcCalReport {
+    fn default() -> Self {
+        Self {
+            before_centi: [0; 2],
+            after_centi: [0; 2],
+            base: [0; 2],
+            best: [0; 2],
+            steps: 0,
+            response_centi: [0; 4],
+            responsive: false,
+            skipped: false,
+        }
+    }
+}
+
+fn dc_cost(dc: [f32; 2]) -> f32 {
+    dc[0] * dc[0] + dc[1] * dc[1]
+}
+
+fn dc_apply(i: i32, q: i32) {
+    unsafe {
+        phy_pbus_force_test(2, 2, i as u32);
+        phy_pbus_force_test(3, 2, q as u32);
+    }
+    // DAC 稳定延时（espsoup vTaskDelay 10 ms；忙等保守实现）
+    for _ in 0..2_400_000u32 {
+        core::hint::spin_loop();
+    }
+}
+
+fn clamp_i32(value: i32, low: i32, high: i32) -> i32 {
+    if value < low {
+        low
+    } else if value > high {
+        high
+    } else {
+        value
+    }
+}
+
+fn abs_f32(value: f32) -> f32 {
+    if value < 0.0 {
+        -value
+    } else {
+        value
+    }
+}
+
+fn round_f32(value: f32) -> i32 {
+    if value >= 0.0 {
+        (value + 0.5) as i32
+    } else {
+        (value - 0.5) as i32
+    }
+}
+
+fn to_centi(value: f32) -> i32 {
+    round_f32(value * 100.0)
+}
+
+/// PBUS 调试通道自检（DC 校准诊断）：进入 debug 模式，读 (2,2) 现值，
+/// debug 模式内再读、强制写 400 后读回、写 (3,2) 后读回、还原。
+/// 返回 [work 模式 rd(2,2)、debug 模式 rd(2,2)、force(2,2,400) 后、
+/// force(3,2,100) 后 rd(3,2)]。
+#[must_use]
+pub fn pbus_self_test() -> [u32; 4] {
+    unsafe {
+        let work_before = phy_pbus_rd(2, 2);
+        phy_pbus_debugmode();
+        let debug_before = phy_pbus_rd(2, 2);
+        phy_pbus_force_test(2, 2, 400);
+        let forced_i = phy_pbus_rd(2, 2);
+        phy_pbus_force_test(3, 2, 100);
+        let forced_q = phy_pbus_rd(3, 2);
+        phy_pbus_force_test(2, 2, work_before);
+        phy_pbus_force_test(3, 2, 258);
+        phy_pbus_workmode();
+        [work_before, debug_before, forced_i, forced_q]
     }
 }
