@@ -60,16 +60,17 @@ async fn tx_probe_task(mut radio: Radio) {
     radio.tx_chain_on(TX_POWER).unwrap();
     defmt::info!("tx chain on (power step {})", TX_POWER);
 
-    // ---- 阶段 2：有限回放 passes=1，测 DAC 完成耗时 ----
-    // 期望：4096 字 @80 MS/s = 51.2 µs = 12288 cycles @240 MHz（±测量开销）
-    {
-        let mut replay = Replay::start(TONE_WORDS, false, 1, 0).unwrap();
-        defmt::info!("finite replay armed, ctrl=0x{:08x}", replay.ctrl());
+    // ---- 阶段 2：有限回放 passes=1 测耗时；再测 HALF=1（40 MS/s 档）----
+    for rate_40msps in [false, true] {
+        let mut replay = Replay::start(TONE_WORDS, rate_40msps, 1, 0).unwrap();
+        defmt::info!(
+            "finite replay armed (half={}), ctrl=0x{:08x}",
+            rate_40msps,
+            replay.ctrl()
+        );
         match replay.wait_done(240_000_000) {
             Ok(cycles) => {
                 // 实测反推 DAC 速率：count / (cycles / 240 MHz)。
-                // zephyr 标称 80/40 MS/s（HALF 位），本板实测约 120 MS/s
-                // （8140 cycles / 4096 字）——时钟基准差异待 C5b 标定。
                 let elapsed_ns = u64::from(cycles) * 1_000_000 / 240_000;
                 let rate_khz = if elapsed_ns > 0 {
                     TONE_WORDS as u64 * 1_000_000 / elapsed_ns * 1000
@@ -77,12 +78,12 @@ async fn tx_probe_task(mut radio: Radio) {
                     0
                 };
                 defmt::info!(
-                    "finite replay done: {} cycles = {} ns, implied DAC {} kHz, ctrl=0x{:08x} done={}",
+                    "finite replay (half={}) done: {} cycles = {} ns, implied DAC {} kHz, ctrl=0x{:08x}",
+                    rate_40msps,
                     cycles,
                     elapsed_ns,
                     rate_khz,
-                    replay.ctrl(),
-                    replay.done()
+                    replay.ctrl()
                 );
             }
             Err(error) => defmt::error!("finite replay wait failed: {:?}", error),

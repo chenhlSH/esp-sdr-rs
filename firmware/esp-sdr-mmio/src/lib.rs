@@ -289,6 +289,8 @@ pub use hardware::{assert_stack_clear_of_dump_bank, DumpEngine};
 pub mod diag;
 /// C5 TX 回放引擎（DAC 循环回放，zephyr esp_sdr_replay.c 的 Rust 重写）。
 pub mod replay;
+/// C5 paced TX（CPU 逐样本注入 DAC，zephyr esp_sdr_tx_paced.c 的 Rust 重写）。
+pub mod tx;
 #[cfg(target_arch = "riscv32")]
 pub use diag::{DiagStream, BLOCK_BYTES, DIAG_PINS, RING_BYTES, diag_bus_start, diag_bus_stop};
 

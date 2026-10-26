@@ -168,17 +168,22 @@ impl Replay {
     }
 
     /// 阻塞等待有限回放完成；返回消耗的 CPU 周期数（rdcycle 差）。
+    /// 轮询在临界区内进行（屏蔽中断）：中断延迟会污染 rdcycle 计时，
+    /// 实测两次测量差 16%，屏蔽后与引擎时序一致（zephyr 在 irq_lock
+    /// 内轮询，同款做法）。
     pub fn wait_done(&self, timeout_cycles: u32) -> Result<u32, ReplayError> {
         assert!(!self.endless, "wait_done on an endless replay");
-        let started = cycle_count();
-        loop {
-            if self.done() {
-                return Ok(cycle_count().wrapping_sub(started));
+        critical_section::with(|_| {
+            let started = cycle_count();
+            loop {
+                if self.done() {
+                    return Ok(cycle_count().wrapping_sub(started));
+                }
+                if cycle_count().wrapping_sub(started) >= timeout_cycles {
+                    return Err(ReplayError::Timeout);
+                }
             }
-            if cycle_count().wrapping_sub(started) >= timeout_cycles {
-                return Err(ReplayError::Timeout);
-            }
-        }
+        })
     }
 
     /// 重启有限回放（RUN 清零 → 写回 ctrl；zephyr esp_sdr_replay_restart）。

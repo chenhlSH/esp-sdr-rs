@@ -8,6 +8,8 @@ defmt.workspace = true
 esp-hal = { workspace = true }
 esp-sdr-shared = { path = "../../shared" }
 esp32c5 = { workspace = true }
+# 回放时序测量用临界区（复用 esp-hal 提供的实现；仅关中断不分配）
+critical-section = "1.2"
 
 [features]
 esp32c5 = ["esp-hal/esp32c5"]

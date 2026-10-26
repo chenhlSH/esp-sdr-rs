@@ -8,14 +8,172 @@
 /// 诊断总线流的定点信号处理（box16 + CIC + 归一化），主机可测。
 pub mod dsp;
 
+/// TX 多相脉冲成形（Blackman-sinc 低通，zephyr esp_sdr_paced.c
+/// fir_design 同款；表由 tools/gen_tx_fir.ps1 预生成）。
+///
+/// 用途：paced TX 的插值——符号速率样本经 L 倍插值多相 FIR 到 DAC
+/// 速率。L=1 直通（无表）。Q15 系数、8 抽头。
+pub mod tx {
+    /// FIR 抽头数（zephyr FIR_TAPS）。
+    pub const FIR_TAPS: usize = 8;
+    /// 最大插值因子（zephyr FIR_MAX_L）。
+    pub const FIR_MAX_INTERP: usize = 8;
+
+    /// L=2 多相系数（2 相位 × 8 抽头，Q15）。
+    pub const COEF_2: [[i16; FIR_TAPS]; 2] = include!("tx_fir_2.rs");
+    /// L=4 多相系数。
+    pub const COEF_4: [[i16; FIR_TAPS]; 4] = include!("tx_fir_4.rs");
+    /// L=8 多相系数。
+    pub const COEF_8: [[i16; FIR_TAPS]; 8] = include!("tx_fir_8.rs");
+
+    /// 取插值因子对应的相位表（L=1 无表，返回空）。
+    #[must_use]
+    pub fn coefficients(interp: usize) -> &'static [[i16; FIR_TAPS]] {
+        match interp {
+            2 => &COEF_2,
+            4 => &COEF_4,
+            8 => &COEF_8,
+            _ => &[],
+        }
+    }
+
+    /// 平移历史环：样本入队（最新在前，镜像存两份使窗口连续——
+    /// zephyr hi[2*FIR_TAPS] 同款）。L=1 直通不需要历史。
+    #[derive(Debug, Clone)]
+    pub struct Shaper {
+        history_i: [i16; 2 * FIR_TAPS],
+        history_q: [i16; 2 * FIR_TAPS],
+        /// 下一符号写入位置（FIR_TAPS-1 递减到 0，环形）。
+        position: usize,
+        /// 当前插值相位。
+        phase: usize,
+        /// 插值因子（1/2/4/8）。
+        interp: usize,
+        coefficients: &'static [[i16; FIR_TAPS]],
+    }
+
+    impl Shaper {
+        #[must_use]
+        pub fn new(interp: usize) -> Self {
+            assert!(
+                interp == 1 || interp == 2 || interp == 4 || interp == 8,
+                "interp must be 1/2/4/8"
+            );
+            Self {
+                history_i: [0; 2 * FIR_TAPS],
+                history_q: [0; 2 * FIR_TAPS],
+                position: 0,
+                phase: 0,
+                interp,
+                coefficients: coefficients(interp),
+            }
+        }
+
+        /// 检查是否该接收新符号（相位 0；L=1 每个输出样本都需要新符号）。
+        #[must_use]
+        pub fn symbol_due(&self) -> bool {
+            self.interp == 1 || self.phase == 0
+        }
+
+        /// 检查是否该接收新符号（相位 0），若需要则把符号压入历史，
+        /// 返回 true。`scale` 为输入到 DAC 量程的移位（zephyr >>6：
+        /// 16 位全幅 → 10 位）。
+        pub fn push_if_due(&mut self, i: i16, q: i16, scale: u32) -> bool {
+            if self.interp > 1 && self.phase != 0 {
+                return false;
+            }
+            let shift = if self.interp == 1 { 0 } else { scale };
+            let i = if shift >= 16 { 0 } else { i >> shift };
+            let q = if shift >= 16 { 0 } else { q >> shift };
+            self.position = if self.position == 0 {
+                FIR_TAPS - 1
+            } else {
+                self.position - 1
+            };
+            self.history_i[self.position] = i;
+            self.history_i[self.position + FIR_TAPS] = i;
+            self.history_q[self.position] = q;
+            self.history_q[self.position + FIR_TAPS] = q;
+            true
+        }
+
+        /// 生成下一个 DAC 样本（10 位有符号 I/Q，±511 语义）并推进相位。
+        /// L=1 时直通当前符号。
+        pub fn next(&mut self) -> (i32, i32) {
+            if self.interp == 1 {
+                return (
+                    i32::from(self.history_i[self.position]),
+                    i32::from(self.history_q[self.position]),
+                );
+            }
+            let coefficients = &self.coefficients[self.phase];
+            let mut accumulator_i: i32 = 0;
+            let mut accumulator_q: i32 = 0;
+            for tap in 0..FIR_TAPS {
+                let coefficient = i32::from(coefficients[tap]);
+                accumulator_i += coefficient * i32::from(self.history_i[self.position + tap]);
+                accumulator_q += coefficient * i32::from(self.history_q[self.position + tap]);
+            }
+            self.phase = (self.phase + 1) & (self.interp - 1);
+            (accumulator_i >> 15, accumulator_q >> 15)
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::Shaper;
+
+        #[test]
+        fn dc_gain_is_unity() {
+            // 常数输入经黑曼-sinc 低通后应收敛到同值（增益 1，Q15）
+            for interp in [2usize, 4, 8] {
+                let mut shaper = Shaper::new(interp);
+                let mut last = (0i32, 0i32);
+                for _ in 0..64 {
+                    shaper.push_if_due(256, -256, 0);
+                    for _ in 0..interp {
+                        last = shaper.next();
+                    }
+                }
+                assert!((last.0 - 256).abs() <= 8, "interp {} I drift: {}", interp, last.0);
+                assert!((last.1 + 256).abs() <= 8, "interp {} Q drift: {}", interp, last.1);
+            }
+        }
+
+        #[test]
+        fn impulse_is_centered_and_bounded() {
+            let mut shaper = Shaper::new(4);
+            // 单个脉冲后跟零
+            shaper.push_if_due(400, 0, 0);
+            let mut peak = 0i32;
+            for cycle in 0..8 {
+                for _ in 0..4 {
+                    let (i, _) = shaper.next();
+                    peak = peak.max(i.abs());
+                }
+                if cycle > 0 {
+                    shaper.push_if_due(0, 0, 0);
+                }
+            }
+            // 插值脉冲峰值不应超过输入（低通），且明显非零
+            assert!(peak > 0 && peak <= 400, "impulse peak {}", peak);
+        }
+
+        #[test]
+        fn interp_one_passthrough() {
+            let mut shaper = Shaper::new(1);
+            shaper.push_if_due(123, -45, 6);
+            assert_eq!(shaper.next(), (123, -45));
+        }
+    }
+}
+
 /// TX 回放单音发生器（定点查表，主机可测）。
 pub mod tone {
     /// 正弦表 256 点，Q15（-32768..=32767）。
-    /// 由 build.rs 之外手工生成：sin(2πk/256)×32767 四舍五入。
+    /// 由 tools 一次性生成（sin(2πk/256)×32767 四舍五入；主机测试
+    /// 验证端点与正交性）。
     const SIN_Q15: [i16; 256] = {
-        // const 上下文里无法调 sin —— 生成规则：委托主机测试验证
-        // 端点/对称性；表值由 Python 一次性生成（见下）。
-        // 这里用整数近似递归不可行，故直接给出四舍五入表。
         include!("sin_q15_table.rs")
     };
 

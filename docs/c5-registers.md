@@ -440,3 +440,34 @@ dc_cal（PBUS debugmode + 强制 DAC 码 + Newton 步进）后实测：
 paced TX（esp_sdr_tx_paced 同款，任意速率/RRC 流式符号）、半双工
 切换时序（TX→RX 恢复延迟实测）。
 
+## 12. C5b paced TX 与半双工（2026-10-26 上板验证）
+
+**回放引擎速率标定（HALF 位，临界区测量）**：HALF=0 → 4096 字耗时
+7091 cycles（两次 7024/7091，±1%）→ **≈138.6 MS/s**；HALF=1 →
+18051-19227 cycles → **≈54.5 MS/s**。比例 ~2.5（非整数 ÷2）——HALF
+切换的是时钟组合而非简单分频；**zephyr 标称的 80/40 MS/s 与本板实测
+不符**（其标称基于对应板/配置）。精确速率一律走 paced 路径。
+
+**paced TX 架构**（zephyr esp_sdr_tx_paced.c 逐行对照）：
+- 每样本写 `TXDC_REG = 0x600a0c08`：bits19:0 = IQ10（±511），
+  bit26 = INJECT（CPU 注入使能）；`upper = (原值 & !0xFFFFF) | INJECT`，
+  停止恢复原值。
+- 节拍：`step = 240 MHz / (rate_hz × interp)` 必须整数；轮询 rdcycle，
+  到点写样本，`target += step`（迟到统计 late/late_max）。
+- 插值：多相 Blackman-sinc 低通（8 抽头 × interp 相位，Q15），表由
+  `tools/gen_tx_fir.ps1` 预生成（zephyr fir_design 公式）；输入 16 位
+  经 >>6 到 DAC 量程（interp=1 直通）。RRC 可替换同一系数接口。
+- **实测每样本开销 ~329 cycles**（TXDC 跨时钟域写主导）→ **可持续
+  样本率上限 ≈730 kS/s**；400 kS/s 实测 late=130/40000（0.33%，
+  偶发 WiFi 抢占，late_max 32242 cycles）。
+
+**QPSK 符号流实测（txsym）**：符号速率 100 kS/s × interp 4 = 400 kS/s
+DAC；100 ms 发射 40,003 样本（精确），统计如上。合法频段 2412 MHz、
+功率步 0（最大回退）。
+
+**半双工 TX→RX 切换时序（实测）**：
+- `tx_chain_off`（vendor tone 关 + prepare_receive PHY 重校准）：
+  **638-642 k cycles = 2.66 ms**；
+- 首次成功采集（含 adctrig 让渡）：**543 k cycles = 2.26 ms**（attempts=1）；
+- **总 TX→RX 可用约 4.9 ms**。RX 恢复后 4096 字全部非零。
+
