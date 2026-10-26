@@ -2,6 +2,7 @@
 name = "esp-sdr-host"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
 
 [dependencies]
 esp-sdr-shared = { path = "../shared" }
