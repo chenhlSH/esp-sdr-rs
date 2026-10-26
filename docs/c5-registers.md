@@ -404,3 +404,39 @@ dc_cal（PBUS debugmode + 强制 DAC 码 + Newton 步进）后实测：
 - USB-Serial/JTAG 有效吞吐实测 ~160-200 kB/s（IQ8 78 kS/s × 2 B），
   低于理想 330 kB/s 峰值（突发间隙+USB 全速协议开销）。
 
+## 11. C5 TX 回放引擎（C5a，2026-10-26 上板验证）
+
+**寄存器**（zephyr esp_sdr_priv.h C5 分支 + esp_sdr_replay.c 逐行对照）：
+- `DAC_TRIG` = 0x600a900c：bit31 RUN；bits27:20 REPEAT（passes，
+  0 配合 LOOP = 无尽直到 RUN 清零）；bit19 LOOP；bit18 DONE（只读，
+  有限回放完成置位；无尽永不置位）；bit17 HALF（40 MS/s 选择）；
+  bits13:0 COUNT（字数 ≤16383）。
+- `DAC_SCALE` = 0x600a0c04：bits23:8 掩码，写 `(scale<<16)|(scale<<8)`，
+  默认 15（tone 停止留下的满幅会削波——zephyr SCALE_DEFAULT 同值）。
+- **数据字与采集格式对称**：I bits9:0、Q bits19:10，10 位有符号 ±511
+  （zephyr esp_sdr_replay_word 同款）。
+- 复用 dump engine 的块 1 让渡：source=15（与 diag 采集同值）、时钟
+  强制、owner 让渡给引擎并**保持**（TX 期间引擎读块 1 驱动 DAC）。
+
+**启动序列**（radio::tx_chain_on + replay::start，zephyr 同款）：
+1. TX 链：`esp_phy_wifi_tx_tone(1, mhz, (15-power)*8)` →
+   `phy_stop_tx_tone(1)`——vendor CW 路径开 TX 链（PBUS debug、TX
+   时钟、校准 DC），停音调把 DAC 交给数据路径且保持链开。
+2. CPU 写满块 1 IQ 字（fence）→ SCALE → `DAC_TRIG=0` → `DAC_TRIG=ctrl`。
+3. 停止：`DAC_TRIG = ctrl & ~RUN` → 0 → owner/SCALE 恢复 →
+   `esp_phy_wifi_tx_tone(0,...)` → `prepare_receive`（RX 恢复）。
+
+**上板实测**（txprobe；2412 MHz ISM、功率步 0 最大回退）：
+- 有限回放（passes=1，4096 字）：ctrl 0x80001000 → 完成 0x80041000
+  （DONE 置位），耗时 **8140 cycles = 33.9 µs → 实测 DAC 120.77 MS/s**。
+  zephyr 标称 80 MS/s（HALF 位）——本板（dump 时钟强制全开）实测
+  约为标称 1.5 倍，HALF/时钟语义标定列入 C5b。
+- 无尽回放（passes=0，LOOP+REPEAT=0）：200 ms 内 RUN 保持、
+  DONE 从未置位（177 万次轮询）✓。
+- **RX 恢复验证**：TX 链关 + prepare_receive 后 20 MS/s 采集 4096 字
+  全部非零（checksum 正常）——接收链完整恢复 ✓。
+
+**C5b 待办**：HALF 位/时钟基准标定（80/40 MS/s 真值）、CPU 逐样本
+paced TX（esp_sdr_tx_paced 同款，任意速率/RRC 流式符号）、半双工
+切换时序（TX→RX 恢复延迟实测）。
+

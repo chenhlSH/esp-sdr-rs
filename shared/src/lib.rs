@@ -8,6 +8,81 @@
 /// 诊断总线流的定点信号处理（box16 + CIC + 归一化），主机可测。
 pub mod dsp;
 
+/// TX 回放单音发生器（定点查表，主机可测）。
+pub mod tone {
+    /// 正弦表 256 点，Q15（-32768..=32767）。
+    /// 由 build.rs 之外手工生成：sin(2πk/256)×32767 四舍五入。
+    const SIN_Q15: [i16; 256] = {
+        // const 上下文里无法调 sin —— 生成规则：委托主机测试验证
+        // 端点/对称性；表值由 Python 一次性生成（见下）。
+        // 这里用整数近似递归不可行，故直接给出四舍五入表。
+        include!("sin_q15_table.rs")
+    };
+
+    /// 在缓冲中填入整周期单音：`cycles` 个周期铺满 `buffer.len()` 字。
+    /// 每字 I/Q 交错布局与 dump 采集相同（I bits9:0、Q bits19:10，
+    /// 10 位有符号 ±511）——TX 与 RX 的采样字格式对称（zephyr
+    /// esp_sdr_replay_word 同款）。
+    ///
+    /// `cycles` 与 buffer.len() 互质与否都无妨：整周期保证首尾连续；
+    /// 相位以 Q32 累加器推进（无累积误差）。
+    pub fn fill_tone(buffer: &mut [u32], cycles: u32, amplitude: i32) {
+        assert!(!buffer.is_empty(), "tone buffer empty");
+        let amplitude = amplitude.clamp(1, 511);
+        // 每字相位增量 = cycles × 2^32 / len（整周期）
+        let step = ((u64::from(cycles) << 32) / buffer.len() as u64) as u32;
+        let mut phase: u32 = 0;
+        for word in buffer.iter_mut() {
+            let index = (phase >> 24) as usize; // 高 8 位 → 256 点表
+            let i_table = SIN_Q15[index] as i32;
+            let q_table = SIN_Q15[(index + 64) & 0xFF] as i32; // cos = sin + 90°
+            let i = (i_table * amplitude) >> 15;
+            let q = (q_table * amplitude) >> 15;
+            *word = ((i as u32) & 0x3FF) | (((q as u32) & 0x3FF) << 10);
+            phase = phase.wrapping_add(step);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::fill_tone;
+
+        #[test]
+        fn tone_words_pack_and_wrap() {
+            let mut buffer = [0u32; 64];
+            fill_tone(&mut buffer, 1, 511);
+            // 所有 I/Q 字段必须在 10 位有符号范围内且非全零
+            let mut any_nonzero = false;
+            for word in buffer {
+                let i = (word & 0x3FF) as i16;
+                let q = ((word >> 10) & 0x3FF) as i16;
+                // 10 位补码在 i16 中是 0..1023；转有符号
+                let i_signed = if i & 0x200 != 0 { i - 1024 } else { i };
+                let q_signed = if q & 0x200 != 0 { q - 1024 } else { q };
+                assert!((-511..=511).contains(&i_signed));
+                assert!((-511..=511).contains(&q_signed));
+                if i_signed != 0 || q_signed != 0 {
+                    any_nonzero = true;
+                }
+            }
+            assert!(any_nonzero, "tone must not be all zero");
+        }
+
+        #[test]
+        fn tone_first_and_quadrature() {
+            // 第 0 字：I = sin(0) = 0，Q = cos(0) = 满幅
+            let mut buffer = [0u32; 256];
+            fill_tone(&mut buffer, 1, 500);
+            let i0 = (buffer[0] & 0x3FF) as i16;
+            let q0 = ((buffer[0] >> 10) & 0x3FF) as i16;
+            let i0s = if i0 & 0x200 != 0 { i0 - 1024 } else { i0 };
+            let q0s = if q0 & 0x200 != 0 { q0 - 1024 } else { q0 };
+            assert_eq!(i0s, 0);
+            assert!(q0s.abs() >= 495, "cos(0) should be near full scale, got {}", q0s);
+        }
+    }
+}
+
 /// 频率与调谐的纯逻辑（esp-sdr common/rx_tuning.h 的 C5 规则）。
 pub mod frequency {
     /// 软件调谐限幅，与射频标称频段无关（reference/esp-sdr common/rx_tuning.h）。

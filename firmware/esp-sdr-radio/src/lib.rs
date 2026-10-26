@@ -41,7 +41,14 @@ pub enum GainError {
 pub enum RadioError {
     Tune(TuneError),
     Gain(GainError),
+    /// TX 功率步超过 15（zephyr TX_POWER_MAX）。
+    TxPower { requested: u32 },
 }
+
+/// TX 功率步上限（每步 2 dB 回退；zephyr TX_POWER_MAX）。
+pub const TX_POWER_MAX: u32 = 15;
+/// 每功率步的回退量（zephyr TX_BACKOFF_STEP）。
+const TX_BACKOFF_STEP: u32 = 8;
 
 /// 增益控制模式。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, defmt::Format)]
@@ -81,6 +88,10 @@ unsafe extern "C" {
     fn phy_pbus_force_test(block: u32, bank: u32, value: u32);
     /// 读 PBUS 表项（debug/工作模式下均为当前生效值）。
     fn phy_pbus_rd(block: u32, bank: u32) -> u32;
+    /// vendor 单音发射（TX 链开关：libphy.a，zephyr esp_sdr_tx_chain_on
+    /// 同款用法）。start=1 开链并调谐到 mhz，start=0 关链。
+    /// backoff 为 2 dB 步进的衰减档（C5 无实际衰减，保留语义）。
+    fn esp_phy_wifi_tx_tone(start: u32, mhz: u32, backoff: u32);
 }
 
 /// C5 逐频点接收重校准（reference/esp-sdr common/rx_recalibration.c C5 分支）。
@@ -246,6 +257,33 @@ impl Radio {
         unsafe {
             force_rx_gain(manual as u32, self.gain_code, 0);
         }
+    }
+
+    /// 开启 TX 链（zephyr esp_sdr_tx_chain_on）：vendor CW 单音路径打开
+    /// 发射链（PBUS debug 模式、TX 时钟、校准 DC）后停掉音调，把 DAC
+    /// 交给数据路径并保持链开。`power` 0..=15（每步 2 dB 回退）。
+    ///
+    /// 前置：已调谐到目标频点（set_frequency）；回放引擎（mmio replay）
+    /// 随后启动。仅限合法频段由调用方保证。
+    pub fn tx_chain_on(&mut self, power: u32) -> Result<(), RadioError> {
+        if power > TX_POWER_MAX {
+            return Err(RadioError::TxPower { requested: power });
+        }
+        self.receive_ready = false;
+        unsafe {
+            esp_phy_wifi_tx_tone(1, self.frequency_mhz, (TX_POWER_MAX - power) * TX_BACKOFF_STEP);
+            phy_stop_tx_tone(1);
+        }
+        Ok(())
+    }
+
+    /// 关闭 TX 链并恢复 RX（zephyr esp_sdr_tx_chain_off：vendor tone 关 +
+    /// 重新准备接收链）。
+    pub fn tx_chain_off(&mut self) {
+        unsafe {
+            esp_phy_wifi_tx_tone(0, self.frequency_mhz, 0);
+        }
+        self.prepare_receive();
     }
 
     /// 基带 DC 硬件校准（移植自 espsoup dc_cal.h / ESPARGOS

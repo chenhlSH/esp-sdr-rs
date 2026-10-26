@@ -287,6 +287,8 @@ pub use hardware::{assert_stack_clear_of_dump_bank, DumpEngine};
 /// C4 无缝流：诊断总线 → GPIO 矩阵回环 → PARLIO → GDMA 环。
 #[cfg(target_arch = "riscv32")]
 pub mod diag;
+/// C5 TX 回放引擎（DAC 循环回放，zephyr esp_sdr_replay.c 的 Rust 重写）。
+pub mod replay;
 #[cfg(target_arch = "riscv32")]
 pub use diag::{DiagStream, BLOCK_BYTES, DIAG_PINS, RING_BYTES, diag_bus_start, diag_bus_stop};
 
