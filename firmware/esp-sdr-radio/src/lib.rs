@@ -298,6 +298,28 @@ impl Radio {
         }
     }
 
+    /// 开启 vendor CW 单音并**保持**（不 stop tone）：完整 WiFi 发射链
+    /// 持续发射未调制载波（LO 处，zephyr rfprobe tone 命令同款）。用于
+    /// 外部接收机验证——不依赖数据路径（DAC 注入）也不依赖本机采集。
+    pub fn tx_cw_on(&mut self, power: u32) -> Result<(), RadioError> {
+        if power > TX_POWER_MAX {
+            return Err(RadioError::TxPower { requested: power });
+        }
+        self.receive_ready = false;
+        unsafe {
+            esp_phy_wifi_tx_tone(1, self.frequency_mhz, (TX_POWER_MAX - power) * TX_BACKOFF_STEP);
+        }
+        Ok(())
+    }
+
+    /// 关闭 vendor CW 单音并恢复 RX。
+    pub fn tx_cw_off(&mut self) {
+        unsafe {
+            esp_phy_wifi_tx_tone(0, self.frequency_mhz, 0);
+        }
+        self.prepare_receive();
+    }
+
     /// 基带 DC 硬件校准（移植自 espsoup dc_cal.h / ESPARGOS
     /// receiver_dc_calibrate；算法为公开的 Newton 2x2 步进）。
     ///

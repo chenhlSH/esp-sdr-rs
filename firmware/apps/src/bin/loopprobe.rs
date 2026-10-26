@@ -72,11 +72,18 @@ fn statistics(words: &[u32]) -> (i32, u64, u32, u32) {
 static STATS_A: AtomicU32 = AtomicU32::new(0);
 
 /// vendor DumpEngine 采集一次并统计（adctrig 路径，C2 已证实有效）。
-fn capture_statistics(dump_engine: &mut DumpEngine) -> Option<(i32, u64, u32)> {
-    match dump_engine.capture_burst(16380, CaptureRate::Msps20) {
+/// 额外返回 checksum 与前两个原始字（验证数据新鲜度与格式）。
+fn capture_statistics(dump_engine: &mut DumpEngine) -> Option<(i32, u64, u32, u64, [u32; 2])> {
+    // 80 MS/s：C2 capburst 验证过的档位（20 MS/s 在本探针下出现
+    // 恒定数据，疑似 ADC 未随该档刷新——先回到已验证档位排除变量）
+    match dump_engine.capture_burst(16380, CaptureRate::Msps80) {
         Ok((words, _)) => {
             let (mean, rms, saturated, _) = statistics(words);
-            Some((mean, rms, saturated))
+            let mut checksum: u64 = 0;
+            for &word in words.iter() {
+                checksum = checksum.wrapping_add(u64::from(word));
+            }
+            Some((mean, rms, saturated, checksum, [words[0], words[1]]))
         }
         Err(error) => {
             defmt::error!("capture failed: {:?}", error);
@@ -91,11 +98,20 @@ async fn loop_probe_task(mut radio: Radio) {
     let mut dump_engine = DumpEngine::new();
 
     // A) 基线（TX 关）
-    let Some((mean_a, rms_a, sat_a)) = capture_statistics(&mut dump_engine) else {
+    let Some((mean_a, rms_a, sat_a, checksum_a, raw_a)) = capture_statistics(&mut dump_engine)
+    else {
         return;
     };
     STATS_A.store(rms_a as u32, Ordering::Relaxed);
-    defmt::info!("A baseline (TX off): mean={} rms={} saturated={}", mean_a, rms_a, sat_a);
+    defmt::info!(
+        "A baseline (TX off): mean={} rms={} saturated={} checksum=0x{:016x} w0=0x{:08x} w1=0x{:08x}",
+        mean_a,
+        rms_a,
+        sat_a,
+        checksum_a,
+        raw_a[0],
+        raw_a[1]
+    );
 
     // B) TX 载波 + duplex RX 采集
     radio.tx_chain_on(TX_POWER).unwrap();
@@ -107,28 +123,42 @@ async fn loop_probe_task(mut radio: Radio) {
             polls += 1;
         }
     }
+    // TXDC 读回（验证注入寄存器写入保持）
+    let txdc_readback = unsafe { core::ptr::read_volatile(0x600a_0c08 as *const u32) };
     radio.rx_chain_duplex_on();
     Timer::after(Duration::from_millis(5)).await;
-    let (mean_b, rms_b, sat_b) = capture_statistics(&mut dump_engine).unwrap_or((0, 0, 0));
+    let (mean_b, rms_b, sat_b, checksum_b, raw_b) =
+        capture_statistics(&mut dump_engine).unwrap_or((0, 0, 0, 0, [0; 2]));
     let rms_delta_permille = if rms_a > 0 {
         rms_b.abs_diff(rms_a) * 1000 / rms_a
     } else {
         0
     };
     defmt::info!(
-        "B duplex (TX on): mean={} rms={} saturated={} rms-delta={}‰",
+        "B duplex (TX on): mean={} rms={} saturated={} rms-delta={}‰ checksum=0x{:016x} w0=0x{:08x} txdc=0x{:08x}",
         mean_b,
         rms_b,
         sat_b,
-        rms_delta_permille
+        rms_delta_permille,
+        checksum_b,
+        raw_b[0],
+        txdc_readback
     );
 
     // C) TX 关（恢复）后统计
     paced.stop();
     radio.tx_chain_off();
     Timer::after(Duration::from_millis(5)).await;
-    let (mean_c, rms_c, sat_c) = capture_statistics(&mut dump_engine).unwrap_or((0, 0, 0));
-    defmt::info!("C after TX off: mean={} rms={} saturated={}", mean_c, rms_c, sat_c);
+    let (mean_c, rms_c, sat_c, checksum_c, raw_c) =
+        capture_statistics(&mut dump_engine).unwrap_or((0, 0, 0, 0, [0; 2]));
+    defmt::info!(
+        "C after TX off: mean={} rms={} saturated={} checksum=0x{:016x} w0=0x{:08x}",
+        mean_c,
+        rms_c,
+        sat_c,
+        checksum_c,
+        raw_c[0]
+    );
 
     // 判定
     let tx_visible = rms_delta_permille > 200 || sat_b > sat_a + 100;
@@ -168,9 +198,12 @@ async fn main(spawner: Spawner) {
     controller
         .set_power_saving(esp_radio::wifi::PowerSaveMode::None)
         .unwrap();
-    controller
-        .set_channel(1, esp_radio::wifi::SecondaryChannel::None)
-        .unwrap();
+    controller.set_channel(1, esp_radio::wifi::SecondaryChannel::None).unwrap();
+    // 混杂模式保活接收链（C2 教训：未连接 STA 时 RX 链下电 → ADC
+    // 冻结常量，采集到近零 RMS）
+    let sniffer = controller.sniffer();
+    sniffer.set_promiscuous_mode(true).unwrap();
+    drop(sniffer);
     drop(controller);
 
     let mut radio = Radio::new();
