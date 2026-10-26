@@ -117,3 +117,41 @@ netsh wlan show networks mode=bssid | findstr /i "ESP-SDR"
 - 主机侧串口栈的坑与固件同等重要：USB-SJ 的行为要按"只能顺序读"设计。
 - 任务书之外的"能不能直接发 WiFi"给了最高价值的对照实验：vendor PHY 通、
   裸 DAC 不通，直接把问题范围收敛到 DAC 数据路径配置。
+
+## 8. 隐私审计与归档清单（2026-10-26）
+
+扫描范围：全部 git 跟踪文件、git 元数据、本地配置。结论如下。
+
+### 8.1 跟踪文件：无个人信息
+
+- 无 `C:\Users\...`、`D:\<工作目录>\...`、`/home/...` 等本地绝对路径；
+- 无用户名、邮箱、主机名、API key、密码或 token（模式扫描 0 命中）；
+- 唯一 MAC 是 Beacon 中自造的本地管理地址 `02:45:53:50:44:52`（首字节
+  0x02，不属于任何厂商）；`127.0.0.1` / `192.168.2.1` 是协议地址，非个人信息；
+- `docs/spectrum-example.csv` 只是频谱功率数据，可能反映本地 RF 环境（信道
+  占用），不含身份信息；如介意可删除；
+- 仓库未配置 git remote；`.git/config` 无身份配置。
+
+### 8.2 git 元数据：含作者身份（唯一泄露点）
+
+- 全部提交的 author/committer 均为项目所有者的姓名与 163 邮箱（具体值可用
+  `git log --format='%an <%ae>'` 查看）；`.git/logs/HEAD`（reflog）同样含该身份。
+- 提交内容本身已确认无个人信息；若对外分享仓库，这是唯一需要处理的点。
+
+### 8.3 本地生成物（未跟踪，但物理存在）
+
+- `target/`：构建缓存。`.fingerprint/*.json` 实测含 `C:\Users\<用户名>\...`
+  形式的本地路径（已命中）。**打包时必须排除**。
+- `reference/`：参考仓库克隆，含各自 `.git` 与上游作者信息，**打包时排除**。
+- `.git/`：含 8.2 的身份元数据。
+
+### 8.4 建议
+
+- **个人存档**：现状即可。推荐用 `git archive --format=zip -o esp-sdr-rs.zip HEAD`
+  导出源码包（不含 `.git/`、`target/`、`reference/`，因此不含作者身份与本地路径）；
+  若要保留 git 历史，则压缩整个目录并手动排除 `target/`、`reference/`。
+- **对外分享且要匿名**：先在**副本**上重写作者身份（`git filter-repo --mail-map`
+  或 `git filter-branch --env-filter`），再打包。重写会改变全部 commit hash，
+  原始仓库不要动。
+- `.gitignore` 已覆盖构建产物、参考克隆、本地抓包/频谱/日志、编辑器杂项与
+  本地密钥文件；提交前用 `git status --short` 确认无新增未跟踪文件。

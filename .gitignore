@@ -1,4 +1,25 @@
+# 构建产物与参考克隆（体积大、可重建；不要打包进归档）
 /target/
 /reference/
 /.history/
 /tools/espflash/*.zip
+
+# 本地生成的抓包、频谱与日志（示例数据保留在 docs/）
+spectrum.csv
+*.ppm
+/captures/
+/*.bin
+*.log
+
+# 编辑器与操作系统杂项
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# 本地密钥/环境配置（仓库不包含任何密钥）
+.env
+.env.*
+*.pem
+*.key

@@ -164,10 +164,19 @@ PAC 为 esp32c5 0.3.0（与 esp-hal 内部一致，避免类型分裂）。
 - [REFERENCES.md](REFERENCES.md)：参考仓库与固定 commit
 - [vendor/README.md](vendor/README.md)：vendor blob 来源与符号验证
 
+## 许可
+
+本项目代码（firmware / host / shared / tools）以 **GPL-3.0-or-later** 发布，全文见
+[LICENSE](LICENSE)。选择 GPL 的原因：寄存器序列与 RF 调用路径系统性参考了 GPL-3.0
+的 esp-sdr / esp-sdr-zephyr / espsoup-firmware（只读参考，不入库）。
+
+`vendor/` 下的 Espressif 二进制 blob（librftest.a / libbttestmode.a）不属于本项目，
+按 ESP-IDF SDK 许可分发；`reference/` 为参考仓库克隆区，不入库。
+
 ## 归档信息
 
 - 功能基线：commit `48a9458`（C5c raw 802.11 Beacon 成功）；本仓库结构与文档整理为其后提交。
 - 日期：2026-10-26。板卡：ESP32-C5HR8 rev v1.2（仅此一块板验证）。
 - 不入库内容：`target/`（构建产物）、`reference/`（可用脚本重建）、`.history/`。
-- 许可：本项目代码独立编写；参考仓库为 GPL-3.0（只读参考），vendor blob 随
-  ESP-IDF SDK 许可分发。
+- 打包归档时请排除 `target/`、`reference/`、`.history/`；如需完全匿名，另见
+  `docs/final-report.md` 的隐私审计说明。
