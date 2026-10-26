@@ -24,13 +24,11 @@ const NODES: usize = RING_BYTES / NODE_BYTES;
 const RING_ADDRESS: u32 = 0x4082_0000;
 const DESC_ADDRESS: u32 = RING_ADDRESS + RING_BYTES as u32;
 
-/// PARLIO 采样时钟（MHz）。20：消费预算裁定——Rust 安全代码的
-/// box16+CIC 实测 7.8 cycles/byte（板上 rdcycle，commit bfb22f1 后），
-/// 40 MB/s 需 312 MHz > CPU 240 MHz（zephyr 的 4.1-4.4 是手写汇编）。
-/// 20 MB/s × 7.8 = 156M cycles = 65% CPU，零跳变消费可行。20 MHz 视界
-/// 覆盖一个完整 WiFi 信道。提回 40 需 DSP 内联汇编（约 4 c/B），
-/// 已列入 docs/c5-registers.md §10.3 待定项。
-const PARL_SAMPLE_MHZ: u32 = 20;
+/// PARLIO 采样时钟（MHz）。40 = 满速（C5 外设上限）——预算裁定：
+/// 汇编 CIC 实测 3.38 cycles/byte（板上 rdcycle，diagprobe2 等价性 PASS），
+/// 40 MB/s × 3.38 = 135M cycles = CPU 240MHz 的 56%，预算内。
+/// 20 MHz 中间档（Rust 标量 CIC 8.27 c/B 时）已被汇编路径取代。
+const PARL_SAMPLE_MHZ: u32 = 40;
 /// PLL_F240M 分频值（integer-1 语义：240/(div+1)）。
 const PARL_CLK_DIV_NUM: u16 = (240 / PARL_SAMPLE_MHZ - 1) as u16;
 
@@ -87,6 +85,9 @@ pub struct DiagStream {
     producer_bytes: u64,
     overrun: bool,
     running: bool,
+    /// 兜底扫描归还的"孤儿完成"描述符数（确认落后一圈的自愈计数；
+    /// 正常消费节拍下应恒为 0）。
+    orphaned_reclaimed: u32,
 }
 
 fn rd(address: u32) -> u32 {
@@ -518,12 +519,26 @@ impl DiagStream {
             producer_bytes: 0,
             overrun: false,
             running: true,
+            orphaned_reclaimed: 0,
         }
+    }
+
+    /// 兜底扫描归还的孤儿完成计数（>0 说明消费曾落后 DMA 一圈并自愈）。
+    #[must_use]
+    pub fn orphaned_reclaimed(&self) -> u32 {
+        self.orphaned_reclaimed
     }
 
     /// 轮询推进生产计数：遍历描述符自上次位置起已完成的长度写回，
     /// 并清 GDMA RX 中断状态（zephyr ISR 同款；状态粘滞会挂起 IN 状态机，
     /// 表现为 FIFO 溢出 + 链表停走，C4 实测）。
+    ///
+    /// 兜底扫描（C4 死锁修复）：确认游标落后 DMA 一整圈时，DMA 会停在
+    /// head 身后一个"已完成未归还"的描述符上等待，而 head 又在等 DMA
+    /// 写入前方格子——循环等待永久僵死（实测快照：DMA 停 desc[2] owner=0、
+    /// head=12 length=0）。head 处无新数据时全环扫描归还已完成格即可自愈
+    /// （这些格的数据在消费者身后：确认落后一圈 ⇔ 生产超前消费一圈 ⇔
+    /// 过跑语义，归还/覆盖符合 zephyr 的丢最旧约定）。
     pub fn poll_producer(&mut self) -> u64 {
         let dma = unsafe { esp32c5::DMA::steal() };
         dma.in_int_ch(0).clr().write(|w| unsafe { w.bits(u32::MAX) });
@@ -544,6 +559,24 @@ impl DiagStream {
         }
         if walked == NODES {
             self.overrun = true;
+        }
+        if walked == 0 {
+            // head 处无新数据：全环兜底扫描（见上方死锁说明）
+            for index in 0..NODES {
+                if index == self.head {
+                    continue;
+                }
+                let desc = DESC_ADDRESS + (index as u32) * 12;
+                let dw0 = unsafe { read_volatile(desc as *const u32) };
+                let length = (dw0 & DW0_LENGTH_MASK) >> 12;
+                if length != 0 {
+                    unsafe {
+                        write_volatile(desc as *mut u32, (dw0 & !DW0_LENGTH_MASK) | DW0_OWNER_DMA);
+                    }
+                    self.producer_bytes += u64::from(length);
+                    self.orphaned_reclaimed += 1;
+                }
+            }
         }
         self.producer_bytes
     }

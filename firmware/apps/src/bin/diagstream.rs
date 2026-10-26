@@ -34,8 +34,9 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 const FREQUENCY_MHZ: u32 = 2412;
 const GAIN_CODE: u32 = 40;
-/// CIC 抽取率：1.25 MS/s（20 MHz 视界 ÷ box16） / 16 = 78.1 kS/s IQ8。
-const CIC_RATE: u32 = 16;
+/// CIC 抽取率：2.5 MS/s（40 MHz 视界 ÷ box16） / 32 = 78.1 kS/s IQ8
+/// （与 C3 交付速率一致，USB-SJ 实测带宽内）。
+const CIC_RATE: u32 = 32;
 /// 每帧 IQ 样本对数（payload 2×512 = 1024 字节）。
 const FRAME_PAIRS: usize = 512;
 const FRAME_BYTES: usize = frame::HEADER_LEN + FRAME_PAIRS * 2;
@@ -202,7 +203,8 @@ async fn stream_task() {
         if available >= DIAG_BOX {
             let take = available.min(CONSUME_CHUNK) & !(DIAG_BOX - 1);
             let bytes = stream.ring_slice_at(consume_offset, take);
-            let pairs = cic.run(bytes, &mut acc);
+            // 汇编 CIC（3.38 c/B @240MHz 实测；与标量路径逐位等价，板上自检 PASS）
+            let pairs = cic.run_asm(bytes, &mut acc);
             consume_offset = (consume_offset + take) % RING_BYTES;
             consumed += take as u64;
             // 归一 → IQ8 入环（2 的幂：位与寻址）
@@ -271,19 +273,21 @@ async fn stream_task() {
     }
 
     let produced = stream.producer_bytes();
+    let stream_orphaned = stream.orphaned_reclaimed();
     stream.stop();
     // 给 USB 任务一点排空时间后打印总结
     Timer::after(Duration::from_millis(500)).await;
     let sent = STATS_FRAMES_SENT.load(Ordering::Relaxed);
     defmt::info!(
-        "FINAL(diagstream): produced={} consumed={} skipped={} dropped={} queued={} sent={} cons_rate={} B/s",
+        "FINAL(diagstream): produced={} consumed={} skipped={} dropped={} queued={} sent={} cons_rate={} B/s orphaned={}",
         produced,
         consumed,
         skipped_total,
         dropped_total,
         queued_total,
         sent,
-        consumed / 60
+        consumed / 60,
+        stream_orphaned
     );
 
     loop {
@@ -293,7 +297,12 @@ async fn stream_task() {
 
 #[esp_hal::main]
 async fn main(spawner: Spawner) {
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    // CPU 240 MHz 显式设置：esp-hal C5 的 CpuClock 默认 80 MHz（从 C0 起
+    // 全部固件漏设，导致消费吞吐全部按错误频率核算——§10.4 的"43.5%
+    // 钉死"真因）。
+    let config = esp_hal::Config::default()
+        .with_cpu_clock(esp_hal::clock::CpuClock::_240MHz);
+    let peripherals = esp_hal::init(config);
 
     esp_sdr_apps::init_heap();
 

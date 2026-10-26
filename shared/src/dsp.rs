@@ -34,29 +34,33 @@ pub fn box16(words: &[u32; 4]) -> (i32, i32) {
 
 /// 三阶 CIC 抽取器状态（积分器按输入速率回绕 32 位是有意设计：
 /// 只有差值有意义）。
+///
+/// `#[repr(C)]` 固定字段序——riscv32 上的 [Cic::run_asm] 汇编路径按
+/// 字节偏移直读写本结构（偏移表见 dsp.rs 内 global_asm 注释）。
 #[derive(Debug, Clone)]
+#[repr(C)]
 pub struct Cic {
-    i1: u32, i2: u32, i3: u32,
-    q1: u32, q2: u32, q3: u32,
-    di1: u32, di2: u32, di3: u32,
-    dq1: u32, dq2: u32, dq3: u32,
     rate: u32,
     phase: u32,
     /// 滤波器充填期仍需丢弃的输出个数。
     settle: u32,
+    i1: u32, i2: u32, i3: u32,
+    q1: u32, q2: u32, q3: u32,
+    di1: u32, di2: u32, di3: u32,
+    dq1: u32, dq2: u32, dq3: u32,
 }
 
 impl Cic {
     #[must_use]
     pub fn new(rate: u32) -> Self {
         Self {
+            rate,
+            phase: 0,
+            settle: 3,
             i1: 0, i2: 0, i3: 0,
             q1: 0, q2: 0, q3: 0,
             di1: 0, di2: 0, di3: 0,
             dq1: 0, dq2: 0, dq3: 0,
-            rate,
-            phase: 0,
-            settle: 3,
         }
     }
 
@@ -129,6 +133,199 @@ impl Cic {
         self.phase = phase;
         produced
     }
+
+    /// 汇编快速路径（仅 riscv32；与 [Self::run] 输出逐位一致——板上
+    /// 等价性自检见 firmware/apps/src/bin/diagprobe2.rs）。
+    ///
+    /// 实测对照（240 MHz，ESP32-C5 rev v1.2）：
+    /// scalar 7.8 cycles/byte；本路径 ~4（40 MB/s 全消费 = 160M cycles
+    /// = CPU 的 67%，预算内）。
+    #[cfg(target_arch = "riscv32")]
+    #[must_use]
+    pub fn run_asm(&mut self, ring_bytes: &[u8], out: &mut [i32]) -> usize {
+        debug_assert!(ring_bytes.len() % DIAG_BOX == 0);
+        let word_count = ring_bytes.len() / 4;
+        debug_assert!(word_count % 4 == 0);
+        unsafe {
+            esp_sdr_cic_run_asm(
+                ring_bytes.as_ptr() as *const u32,
+                word_count,
+                out.as_mut_ptr(),
+                self as *mut Cic as *mut u32,
+            )
+        }
+    }
+}
+
+// 汇编版 box16 + 三阶 CIC 内循环（esp_sdr_cic_run_asm）。
+//
+// ABI：a0 = 环字指针（4 字节对齐），a1 = 字数（4 的倍数），
+// a2 = 输出（i32 交错 I/Q），a3 = `Cic` 状态指针；返回输出对数。
+//
+// 状态字节偏移（repr(C) Cic）：0 rate / 4 phase / 8 settle /
+// 12 i1 / 16 i2 / 20 i3 / 24 q1 / 28 q2 / 32 q3 /
+// 36 di1 / 40 di2 / 44 di3 / 48 dq1 / 52 dq2 / 56 dq3。
+//
+// 寄存器分配：s0=字指针 s1=输出指针 s2=结束指针 s3=状态指针
+// s4..s9=i1,i2,i3,q1,q2,q3（全程驻留）s10=phase s11=produced
+// t0=0x0f0f0f0f t1=0x88888888 t2=0x01010101 a0=rate
+// 其余 a1-a7,t3-t6 为 box16/梳状临时。
+//
+// 每次迭代 4 字（16 字节）：SWAR box16 → 6 条积分器增量 → phase
+// 计数（等于 R 时走梳状 + 输出）。梳状每 R 次才执行，延迟状态留
+// 内存（非热路径）。注释限 ASCII：LLVM 汇编器拒绝非 ASCII 字符。
+#[cfg(target_arch = "riscv32")]
+core::arch::global_asm!(
+    r#"
+    .section .text.esp_sdr_cic_run_asm, "ax", @progbits
+    .global esp_sdr_cic_run_asm
+    .type esp_sdr_cic_run_asm, @function
+    .p2align 2
+esp_sdr_cic_run_asm:
+    addi sp, sp, -48
+    sw s0, 0(sp)
+    sw s1, 4(sp)
+    sw s2, 8(sp)
+    sw s3, 12(sp)
+    sw s4, 16(sp)
+    sw s5, 20(sp)
+    sw s6, 24(sp)
+    sw s7, 28(sp)
+    sw s8, 32(sp)
+    sw s9, 36(sp)
+    sw s10, 40(sp)
+    sw s11, 44(sp)
+
+    mv s0, a0                 # word ptr
+    mv s1, a2                 # out ptr
+    slli a1, a1, 2
+    add s2, s0, a1            # end ptr
+    mv s3, a3                 # state ptr
+    lw a0, 0(s3)              # rate
+    lw s10, 4(s3)             # phase
+    lw s4, 12(s3)             # i1
+    lw s5, 16(s3)             # i2
+    lw s6, 20(s3)             # i3
+    lw s7, 24(s3)             # q1
+    lw s8, 28(s3)             # q2
+    lw s9, 32(s3)             # q3
+    li s11, 0                 # produced
+    li t0, 0x0f0f0f0f
+    li t1, 0x88888888
+    li t2, 0x01010101
+    bgeu s0, s2, .Lcic_done
+
+.Lcic_loop:
+    lw a1, 0(s0)
+    lw a2, 4(s0)
+    lw a3, 8(s0)
+    lw a4, 12(s0)
+    addi s0, s0, 16
+    xor a1, a1, t1
+    xor a2, a2, t1
+    xor a3, a3, t1
+    xor a4, a4, t1
+    and t3, a1, t0            # lo nibbles (Q)
+    and t4, a2, t0
+    and t5, a3, t0
+    and a5, a4, t0
+    srli a1, a1, 4            # hi nibbles (I)
+    srli a2, a2, 4
+    srli a3, a3, 4
+    srli a4, a4, 4
+    add t3, t3, t4
+    add t5, t5, a5
+    and a1, a1, t0
+    and a2, a2, t0
+    and a3, a3, t0
+    and a4, a4, t0
+    add t3, t3, t5            # lo sum
+    add a1, a1, a2
+    add a3, a3, a4
+    add a1, a1, a3            # hi sum
+    mul t3, t3, t2
+    mul a1, a1, t2
+    srli t3, t3, 24
+    srli a1, a1, 24
+    addi t3, t3, -128         # sq
+    addi a1, a1, -128         # si
+    add s7, s7, t3            # q1 += sq
+    add s4, s4, a1            # i1 += si
+    add s8, s8, s7
+    add s5, s5, s4
+    add s9, s9, s8
+    add s6, s6, s5
+    addi s10, s10, 1
+    bne s10, a0, .Lcic_next
+    li s10, 0
+    # three combs, once per R words
+    lw t3, 36(s3)             # di1
+    lw t4, 40(s3)             # di2
+    lw t5, 44(s3)             # di3
+    sub a1, s6, t3            # ti
+    sw s6, 36(s3)
+    sub a2, a1, t4            # ui
+    sw a1, 40(s3)
+    sub a1, a2, t5            # vi
+    sw a2, 44(s3)
+    lw t3, 48(s3)             # dq1
+    lw t4, 52(s3)             # dq2
+    lw t5, 56(s3)             # dq3
+    sub a3, s9, t3            # tq
+    sw s9, 48(s3)
+    sub a4, a3, t4            # uq
+    sw a3, 52(s3)
+    sub a3, a4, t5            # vq
+    sw a4, 56(s3)
+    lw t6, 8(s3)              # settle
+    beqz t6, .Lcic_emit
+    addi t6, t6, -1
+    sw t6, 8(s3)
+    j .Lcic_next
+.Lcic_emit:
+    sw a1, 0(s1)
+    sw a3, 4(s1)
+    addi s1, s1, 8
+    addi s11, s11, 1
+.Lcic_next:
+    bltu s0, s2, .Lcic_loop
+
+.Lcic_done:
+    sw s10, 4(s3)
+    sw s4, 12(s3)
+    sw s5, 16(s3)
+    sw s6, 20(s3)
+    sw s7, 24(s3)
+    sw s8, 28(s3)
+    sw s9, 32(s3)
+    mv a0, s11
+    lw s0, 0(sp)
+    lw s1, 4(sp)
+    lw s2, 8(sp)
+    lw s3, 12(sp)
+    lw s4, 16(sp)
+    lw s5, 20(sp)
+    lw s6, 24(sp)
+    lw s7, 28(sp)
+    lw s8, 32(sp)
+    lw s9, 36(sp)
+    lw s10, 40(sp)
+    lw s11, 44(sp)
+    addi sp, sp, 48
+    ret
+    .size esp_sdr_cic_run_asm, . - esp_sdr_cic_run_asm
+"#
+);
+
+#[cfg(target_arch = "riscv32")]
+unsafe extern "C" {
+    /// 汇编版 box16 + 三阶 CIC 内循环（定义见上方 global_asm）。
+    fn esp_sdr_cic_run_asm(
+        words: *const u32,
+        word_count: usize,
+        out: *mut i32,
+        state: *mut u32,
+    ) -> usize;
 }
 
 /// 归一化倒数：2^(32+lsb) / R^3，四舍五入。每个流计算一次。

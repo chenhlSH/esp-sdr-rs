@@ -163,7 +163,10 @@ async fn gain_maintain_task() {
 
 #[esp_hal::main]
 async fn main(spawner: Spawner) {
-    let peripherals = esp_hal::init(esp_hal::Config::default());
+    // 显式 240 MHz（esp-hal C5 默认 80 MHz）
+    let config = esp_hal::Config::default()
+        .with_cpu_clock(esp_hal::clock::CpuClock::_240MHz);
+    let peripherals = esp_hal::init(config);
 
     esp_sdr_apps::init_heap();
 

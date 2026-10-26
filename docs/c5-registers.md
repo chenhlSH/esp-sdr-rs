@@ -280,52 +280,74 @@ start() 里补 intr_mem 窗口写入；确认 auto_ret 未被显式清零。
   实测不生效 → 0 字节；(b) 裸路径必须显式开 PCR `gdma_conf.gdma_clk_en`
   （手工路径由 esp-hal PeripheralGuard 代办，缺它 DMA 寄存器写入
   全部无效——诊断特征：conf/link/addr 读回全零）。
-- **diagstream 交付 bin**（60 秒上板，最终形态双任务版）：lsb 自动
-  选窗（burst 快照直方图 + robust 中值，3 次重试抗 async USB 中断
-  插入 adctrig 临界窗的 CaptureOverrun）→ WiFi 混杂过滤器清零
-  （FFI `esp_wifi_set_promiscuous_filter`）→ 无缝流（20 MHz 视界）
-  → box16+CIC(R=16) → IQ8 流帧（type 2，512 对/帧，CRC 修覆盖头+载荷）
-  → embassy Channel 交接 → usb_task async 中断驱动写出。实测基线：
-  生产 1.2 GB（20.0 MB/s 满速）、消费 ~512 MB、组帧 ~3900、60 秒
-  零崩溃零 skipped。
+- **diagstream 交付 bin**（最终形态双任务版）：lsb 自动选窗（burst
+  快照直方图 + robust 中值，3 次重试抗 async USB 中断插入 adctrig
+  临界窗的 CaptureOverrun）→ WiFi 混杂过滤器清零（FFI
+  `esp_wifi_set_promiscuous_filter`）→ 无缝流（40 MHz 视界，终态）
+  → box16+CIC(R=32，汇编路径) → IQ8 流帧（type 2，512 对/帧，CRC
+  覆盖头+载荷）→ embassy Channel 交接 → usb_task async 中断驱动写出。
+  终验见 §10.4：40.0 MB/s produced==consumed（精确相等）60 秒。
 - **DC 校准**（espsoup dc_cal：PBUS debugmode + Newton 步进）暂缓：
   DC 仅占窗 ~1/16，lsb 留裕量即可；正式版前再上。
 
-### 10.4 消费性能实录（rdcycle 板上测量，全部负结果同样入档）
+### 10.4 消费性能完整裁定（2026-10-26 终局：80MHz 误设 + 汇编 + 死锁 + 三嫌疑）
 
-**现象**：消费钉死在生产速率的 ~43.5%（20 MB/s 视界下 8.5-8.9 MB/s），
-与 USB 发送（sent=0 时同样钉死）、任务优先级（29/31 无差）、单/双任务
-架构、64 位取模（位与化 +2.7%）、Rust 迭代器（裸指针重写无差）全部无关。
+**根因一（决定性）：CPU 时钟默认 80 MHz。** esp-hal C5 的 `CpuClock`
+枚举 `#[default] _80MHz`，C0 起全部固件用 `esp_hal::Config::default()`
+从未显式设置——所有"消费钉死"现象（8.5 MB/s、"43.5% 比率"、rdcycle
+时间账）在 80 MHz 下完全自洽：Rust 标量 CIC 8.27 c/B × 80 MHz ≈
+9.7 MB/s 上限。**修复：`with_cpu_clock(CpuClock::_240MHz)`。**
+修复后 20 MB/s 视界验收：produced == consumed == 1,200,002,048 字节
+（精确相等）、零 skipped。教训：性能排查第一步核时钟配置，显式优于
+隐式——委托默认值会以"物理现象"面貌掩盖配置疏漏。
 
-**已测得的事实**（diagprobe2 rdcycle 基准 + diagstream 内嵌分段计时）：
-- CIC.run(4096B) = 31,923-32,300 cycles = **7.8 cycles/byte**（box16 SWAR
-  + 三阶积分 + 相位/输出；zephyr 手写汇编 4.1-4.4 作对照）。
-- poll_producer 每轮 77-144 cycles、available/slice/组帧每轮 <160 cycles。
-- 消费循环无 >208µs 的轮间空隙（抢占检测 0 次）；max_loop ≈ 49.8K
-  cycles ≈ 平均轮时长——轮率恒定 4817/s，非竞争性节流。
-- 60s：289,024 轮中仅 44% 实消费轮（每轮满取 4096B），56% 空转轮
-  （环内差为 0——DMA 没有新完成的描述符）。
-- 每轮实做仅 ~16.5K cycles（69µs）但轮周期 207µs：CPU 大部分时间
-  不在本循环（TIMING 合计 ~28% CPU）。
-- in_suc_eof 中断位出现时补 inlink_restart：无效（消费 8.52，已回滚）。
+**根因二（鲁棒性）：确认游标落后一圈的 DMA 死锁。** 轮询确认落后
+DMA 写入整整一圈时：DMA 停在 head 身后"已完成未归还"的描述符上
+（快照证据：DMA 物理游标 desc[2] owner=0、软件 head=12 length=0），
+head 又在等 DMA 写入前方格子——循环等待永久僵死（bench 实测复现，
+大停顿消费场景）。**修复：poll_producer 在 head 处无新数据时全环
+兜底扫描**，归还任何已完成格（语义：确认落后一圈 ⇔ 生产超前消费
+一圈 ⇔ 过跑，归还/覆盖符合丢最旧约定）；`orphaned_reclaimed` 计数
+观测。生产 40 MB/s 60 秒 orphaned=0——正常节拍零动用，纯防御。
 
-**排除法剩余嫌疑**（下一步，需专门一轮）：
-1. DMA 实际写入占空比：56% 空转 = desc 完成间隔远大于理论 179µs
-   （3584B @20MB/s）。可能原因：GDMA 对 PARLIO 从请求的仲裁间隙、
-   PARLIO FIFO→DMA 的握手节奏、或 suc_eof 后链重启的真实延迟。
-   验证法：ISR（in_done 每描述符）里记录时间戳直方图。
-2. esp-rtos 调度/中断底噪吞掉 72% CPU：WiFi blob 任务（混杂模式下
-   活跃 2.4G 信道每帧进驱动，过滤器清零只拦上层递交）+ USB/tick
-   中断。验证法：关 sniffer 后纯 dump 源跑消费基准对照。
-   （espsoup PRUN 40MB/s 用的消费是每 4B 一次 XOR ~1 c/B，仅 17% CPU，
-   对底噪不敏感——不能直接类比。）
-3. 若为底噪：把消费搬进 ISR（GDMA in_done 中断驱动，对齐 zephyr
-   diag_isr 原路径——它在 ISR 里走描述符推生产计数）是架构正解。
+**DSP 内联汇编**（shared/src/dsp.rs `run_asm` + global_asm）：
+- **3.38 cycles/byte**（板上 rdcycle，4000 批完全确定性；scalar 8.27
+  c/B，zephyr C 4.1-4.4 参考对照——寄存器全程驻留 + 单循环体省去
+  迭代器/边界开销）；
+- 等价性自检 PASS×4（实环数据 R=16/16/8 + 同状态链式 3 块，输出与
+  15 字状态逐位一致）——汇编路径的板上金标准验证；
+- 40 MB/s 全消费 = 135 MHz = **CPU 240MHz 的 56%**，预算内。
+- 实现要点：`#[repr(C)]` Cic 状态字节布局（偏移表在源码注释）；
+  s4-s9 六积分器全程驻留；梳状每 R 次触达内存；注释限 ASCII
+  （LLVM 汇编器拒绝中文注释）。
 
-**性能预算修订**：Rust 安全代码 CIC 7.8 c/B 下，40 MB/s 全消费需
-312 MHz > CPU 240，**必须** 20 MHz 视界（65% CPU）或 DSP 内联汇编
-（~4 c/B → 40 MB/s 需 160M=67%）。当前 20 MHz 视界 + 8.5 MB/s 消费
-= IQ8 交付 ~69 kS/s（C3 验收口径 78 kS/s 的 88%）。
+**40 MHz 视界终验**（diagstream 双任务 + asm + 兜底扫描 + 240MHz）：
+**produced == consumed == 2,400,029,184 字节（精确相等）= 40.0 MB/s**、
+skipped=0、dropped 仅 USB 侧（无主机）、orphaned=0，60 秒零错误。
+
+**三嫌疑裁定**（diagprobe2，全部实测数据）：
+1. **DMA 供数占空比——否定**。描述符完成间隔直方图（1 秒窗口轮询
+   差分 + rdcycle）：n=11160/s、avg=21503 cycles（理论 21504，
+   3584 B @40MB/s = 89.6 µs）、min/max=21318/21767（±1% 抖动）。
+   DMA 连续均匀，无停顿。
+2. **WiFi/调度 CPU 抢占——否定**。CPU 份额指数（1 秒 tight loop
+   迭代数）：sniffer on 34,285,592 vs off 34,285,714，
+   **ratio 100.0004%**——混杂模式帧处理 CPU 占用实测为零。
+   （ch14 切换被 esp-radio 拒绝（WifiError）；5G ch36 切换实测有
+   死锁风险，弃用——单纯为对照实验不值得。）
+3. **ISR 驱动生产推进——结案（机制可用，非必需）**。GDMA ISR 实测
+   触发 11161 次/秒（期望 11161，分毫不差）。**完整触发条件 = CPU 侧
+   `bind_handler` + `interrupt::enable` + DMA 控制器侧
+   `in_int_ch(0).ena`（缺一不可）+ 观察期无 poll 的 clr 压制**——
+   C4 早期"ISR bind_handler 未触发"悬案以此结案（当年紧轮询的
+   `in_int_ch(0).clr()` 把 pending 清掉了）。当前生产路径保持
+   轮询+兜底（已验证 40 MB/s + 自愈）；ISR 路径为可选加固，
+   条件已明确写入本节。
+
+**性能预算定稿**：40 MB/s 视界全消费 = asm 56% CPU + poll/framing/
+USB ~15% ≈ 71%，实测富余（60 秒零跳块零孤儿）。若未来上 80 MS/s
+视界（需要 2× 消费 = 112%），则需要双核（C5 单核）/更宽 SIMD/
+或 espsoup 式低算力消费设计。
 
 - **C5 SoftAP 在 esp-radio 1.0.0-beta.1 上不发射信标**：官方未改动的
   embassy_access_point 示例（同 tag、同工具链）在本板同样扫不到
